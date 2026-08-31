@@ -153,7 +153,7 @@ SCENARIOS = {
     },
     # Only TC1 is accepted. ANT1/ANT2 deploy after the TC1 delay; ANT3/ANT4
     # remain stored regardless of TC2 writes.
-    "test04_tc1_only": {
+    "test04__power_no_deploy_then_only_tc1": {
         "mode": "PAIR_TEST",
         "power_pair": None,
         "accept_tc1": True,
@@ -166,7 +166,7 @@ SCENARIOS = {
     },
     # Only TC2 is accepted. ANT3/ANT4 deploy after the TC2 delay; ANT1/ANT2
     # remain stored regardless of TC1 writes.
-    "test05_tc2_only": {
+    "test05_power_no_deploy_then_only_tc2": {
         "mode": "PAIR_TEST",
         "power_pair": None,
         "accept_tc1": False,
@@ -233,9 +233,9 @@ SCENARIOS = {
         "tc2_delay_s": TC2_DEPLOY_DELAY_S,
         "address_set": "main",
     },
-    # Power-on alone does nothing. Only TC1 is accepted and deploys ANT1/ANT2.
-    # power-no-deployment recovery case.
-    "test10_power_no_deploy_then_tc1": {
+    # Power-on alone does nothing. Only TC1 is accepted on red addr and deploys ANT1/ANT2.
+    # power-on deploys tc2 pair
+    "test10_power_tc1_deploy_then_tc1_at_red": {
         "mode": "PAIR_TEST",
         "power_pair": None,
         "accept_tc1": True,
@@ -244,11 +244,11 @@ SCENARIOS = {
         "deploy_on_tc2": False,
         "tc1_delay_s": TC1_DEPLOY_DELAY_S,
         "tc2_delay_s": TC2_DEPLOY_DELAY_S,
-        "address_set": "main",
+        "address_set": "redundant",
     },
-    # Power-on alone does nothing. Only TC2 is accepted and deploys ANT3/ANT4.
-    # This remains separate from test05 for the same reason as test10.
-    "test11_power_no_deploy_then_tc2": {
+    # Power-on alone does nothing. Only TC2 is accepted on red addrnand deploys ANT3/ANT4.
+    # power-on deploys tc1.
+    "test11_power_tc1_deploy_then_tc2_at_red": {
         "mode": "PAIR_TEST",
         "power_pair": None,
         "accept_tc1": False,
@@ -257,7 +257,7 @@ SCENARIOS = {
         "deploy_on_tc2": True,
         "tc1_delay_s": TC1_DEPLOY_DELAY_S,
         "tc2_delay_s": TC2_DEPLOY_DELAY_S,
-        "address_set": "main",
+        "address_set": "redundant",
     },
     # Redundant addresses only. TC1 deploys ANT1/ANT2 and TC2 then deploys
     # ANT3/ANT4 using the normal sequential state machine.
