@@ -235,7 +235,7 @@ SCENARIOS = {
     },
     # Power-on alone does nothing. Only TC1 is accepted on red addr and deploys ANT1/ANT2.
     # power-on deploys tc2 pair
-    "test10_power_tc1_deploy_then_tc1_at_red": {
+    "test10_power_tc2_deploy_then_tc1_at_red": {
         "mode": "PAIR_TEST",
         "power_pair": "TC2",
         "power_delay_s": PAIR_POWER_DEPLOY_DELAY_S,
