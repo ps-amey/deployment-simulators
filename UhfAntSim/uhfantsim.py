@@ -237,7 +237,7 @@ SCENARIOS = {
     # power-on deploys tc2 pair
     "test10_power_tc1_deploy_then_tc1_at_red": {
         "mode": "PAIR_TEST",
-        "power_pair": None,
+        "power_pair": "TC2",
         "accept_tc1": True,
         "accept_tc2": False,
         "deploy_on_tc1": True,
@@ -250,7 +250,7 @@ SCENARIOS = {
     # power-on deploys tc1.
     "test11_power_tc1_deploy_then_tc2_at_red": {
         "mode": "PAIR_TEST",
-        "power_pair": None,
+        "power_pair": "TC1",
         "accept_tc1": False,
         "accept_tc2": True,
         "deploy_on_tc1": False,
