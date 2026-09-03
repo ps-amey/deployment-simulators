@@ -49,11 +49,6 @@ import machine
 import time
 import sys
 
-try:
-    import ujson as json
-except ImportError:
-    import json
-
 # =============================================================================
 #  CONFIGURATION  --  edit this block for your wiring and test scenario
 # =============================================================================
@@ -334,6 +329,28 @@ SCENARIOS = {
         "address_set": "shared",
     },
 }
+
+# Short USB command names mapped to the existing descriptive scenarios.
+TEST_COMMAND_LOOKUP = {
+    "test01": "test01_power_on",
+    "test02": "test02_sequential_deploy",
+    "test03": "test03_no_deploy",
+    "test04": "test04__power_no_deploy_then_only_tc1",
+    "test05": "test05_power_no_deploy_then_only_tc2",
+    "test06": "test06_power_tc1_then_tc2_deploy",
+    "test07": "test07_power_tc1_then_tc2_no_deploy",
+    "test08": "test08_power_tc2_then_tc1_deploy",
+    "test09": "test09_power_tc2_then_tc1_no_deploy",
+    "test10": "test10_power_tc2_deploy_then_tc1_at_red",
+    "test11": "test11_power_tc1_deploy_then_tc2_at_red",
+    "test12": "test12_redundant_tc1_tc2_deploy",
+    "test13": "test13_redundant_tc1_only_tc2_ignored",
+    "test14": "test14_redundant_tc1_ignored_tc2_deploy",
+    "test15": "test15_redundant_ignore_all",
+    "test16": "redundant_deploy",
+    "test17": "shared_i2c_deployment",
+}
+
 ACTIVE_SCENARIO = "test02_sequential_deploy"
 
 # Host/debug reset command. This is intentionally outside the real writable
@@ -955,19 +972,18 @@ def validate_i2c_target_config(name, i2c_id, address, sda, scl):
 def wait_for_usb_configuration():
     print("")
     print("CONFIG_READY")
-    print("Send one JSON configuration line")
     line = sys.stdin.readline()
     if line is None:
-        raise ValueError("No USB configuration received")
-    line = line.strip()
-    if not line:
-        raise ValueError("Empty USB configuration")
-    if len(line) > USB_COMMAND_MAX_BYTES:
-        raise ValueError("USB configuration is too long")
-    request = json.loads(line)
-    if not isinstance(request, dict):
-        raise ValueError("USB configuration must be a JSON object")
-    return request
+        raise ValueError("No USB command received")
+    command = line.strip().lower()
+    if not command:
+        raise ValueError("Empty USB command")
+    if len(command) > USB_COMMAND_MAX_BYTES:
+        raise ValueError("USB command is too long")
+    scenario_name = TEST_COMMAND_LOOKUP.get(command)
+    if scenario_name is None:
+        raise ValueError("Unknown test command: %s" % command)
+    return {"command_id": command, "scenario": scenario_name}
 
 
 def build_session(request):
@@ -980,6 +996,7 @@ def build_session(request):
         if field in request:
             scenario[field] = request[field]
     return {
+        "command_id": request["command_id"],
         "name": scenario_name,
         "scenario": scenario,
         "board_profile": request.get("board_profile", BOARD_PROFILE),
@@ -1123,10 +1140,8 @@ def disable_all_i2c_blocks():
                       PicoI2CSlave._IC_ENABLE] = 0x0001
 
 
-def print_session_ack(session, primary_address, secondary_address):
-    print("ACK scenario=%s board=%s primary=0x%02X secondary=0x%02X" %
-          (session["name"], session["board_profile"], primary_address, secondary_address))
-    print("READY_FOR_OBC")
+def print_session_ack(session):
+    print("ACK=%s" % session["command_id"])
 
 
 def _read_power(di_pin):
@@ -1248,8 +1263,7 @@ def run_session(session):
     slaves = []
     try:
         slaves, di = configure_session_hardware(session)
-        primary_address, secondary_address = scenario_i2c_addresses(session["scenario"])
-        print_session_ack(session, primary_address, secondary_address)
+        print_session_ack(session)
         if session["scenario"]["mode"] == "SHARED_I2C_DEPLOYMENT":
             start_ms, end_ms = run_shared_i2c_deployment(session, slaves[0], di)
         else:
@@ -1267,11 +1281,15 @@ def main():
     disable_all_i2c_blocks()
     while True:
         try:
-            request = wait_for_usb_configuration() if USB_SCENARIO_CONTROL else {"scenario": ACTIVE_SCENARIO}
+            request = (wait_for_usb_configuration()
+                       if USB_SCENARIO_CONTROL else {
+                           "command_id": "configured",
+                           "scenario": ACTIVE_SCENARIO,
+                       })
             session = build_session(request)
             validate_session(session)
-        except (ValueError, TypeError, KeyError) as error:
-            print("NACK reason=%s" % error)
+        except (ValueError, TypeError, KeyError):
+            print("NACK=INVALID")
             continue
         try:
             run_session(session)
