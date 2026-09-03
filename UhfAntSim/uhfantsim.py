@@ -47,6 +47,12 @@
 
 import machine
 import time
+import sys
+
+try:
+    import ujson as json
+except ImportError:
+    import json
 
 # =============================================================================
 #  CONFIGURATION  --  edit this block for your wiring and test scenario
@@ -108,6 +114,11 @@ DI_PULL           = "down"     # "down" | "up" | None  (internal pull on DI pin)
 #   Under the "AIS" profile, selecting a POWER_ON-triggered scenario is rejected
 #   at startup so an AIS board can't be power-deployed by mistake.
 BOARD_PROFILE = "UHF"        # "UHF" | "AIS"
+
+# Configure one finite test session over USB CDC before enabling I2C.
+USB_SCENARIO_CONTROL = True
+DEFAULT_SESSION_DURATION_S = 200
+USB_COMMAND_MAX_BYTES = 256
 
 # Does a thermal cutter need ANT_POWER present to fire? A real burn-wire does,
 # so deployment is gated on power by default. Set False only if your test bench
@@ -452,6 +463,10 @@ class PicoI2CSlave:
         self.address = address
         self._set(self._IC_ENABLE, 0x0001)
 
+    def disable(self):
+        """Disable this I2C target between test sessions."""
+        self._clr(self._IC_ENABLE, 0x0001)
+
     # -- low-level helpers ---------------------------------------------------
     def _setup_pin(self, pin):
         # PADS_BANK0 GPIOx starts at base + 4 + 4*pin. Configure the pad before
@@ -515,7 +530,8 @@ def make_slave(i2c_id, address, sda, scl):
 #  Simulator state / engine
 # =============================================================================
 class DeploymentSim:
-    def __init__(self):
+    def __init__(self, scenario):
+        self.scenario = scenario
         self.reset()
 
     def reset(self):
@@ -552,7 +568,7 @@ class DeploymentSim:
             return
         if self.deployed:
             return
-        scen = SCENARIOS[ACTIVE_SCENARIO]
+        scen = self.scenario
         accept_tc1 = scen.get("accept_tc1", True)
         accept_tc2 = scen.get("accept_tc2", True)
         new_tc1 = bool(cmd & (1 << TC1)) if accept_tc1 else False
@@ -627,8 +643,8 @@ class DeploymentSim:
                 self._timer_trigger = trigger_name
                 self._timer_start = now_ms
                 if DEBUG:
-                    print("[TIMER] '%s' %s condition met; action in %ds"
-                          % (ACTIVE_SCENARIO, trigger_name, delay_s))
+                    print("[TIMER] %s condition met; action in %ss"
+                          % (trigger_name, delay_s))
             elif time.ticks_diff(now_ms, self._timer_start) >= delay_s * 1000:
                 on_complete()
         else:
@@ -639,7 +655,7 @@ class DeploymentSim:
         if self.deployed:
             return
 
-        scen = SCENARIOS[ACTIVE_SCENARIO]
+        scen = self.scenario
         mode = scen["mode"]
 
         if mode == "NO_DEPLOY":
@@ -810,32 +826,34 @@ def record_obc_command(now_ms, start_ms, target, address, command):
         COMMAND_HISTORY_DROPPED += 1
 
 
-def print_test_report(now_ms, start_ms):
-    """Print a concise report for BOARD_PROFILE on Pico USB serial."""
+def print_test_report(now_ms, start_ms, session):
+    """Print a concise report for this completed session on USB serial."""
     elapsed_s = time.ticks_diff(now_ms, start_ms) / 1000
-    scenario = SCENARIOS[ACTIVE_SCENARIO]
-    profile_writes = (PRIMARY_WRITES if BOARD_PROFILE == "UHF"
+    scenario_name = session["name"]
+    scenario = session["scenario"]
+    board_profile = session["board_profile"]
+    profile_writes = (PRIMARY_WRITES if board_profile == "UHF"
                       else SECONDARY_WRITES)
-    profile_reads = (PRIMARY_READS if BOARD_PROFILE == "UHF"
+    profile_reads = (PRIMARY_READS if board_profile == "UHF"
                      else SECONDARY_READS)
 
     print("")
     print("=" * 64)
     print(" ANTENNA DEPLOYMENT TEST REPORT")
     print("=" * 64)
-    print(" Test       : %s" % ACTIVE_SCENARIO)
+    print(" Test       : %s" % scenario_name)
     print(" Mode       : %s" % scenario["mode"])
-    print(" Board      : %s" % BOARD_PROFILE)
+    print(" Board      : %s" % board_profile)
     print(" Addresses  : %s" % scenario["address_set"])
     print(" Elapsed    : %.3f s" % elapsed_s)
 
     print("-" * 64)
     print(" OBC COMMANDS (%d received by %s)" %
-          (profile_writes, BOARD_PROFILE))
+          (profile_writes, board_profile))
     displayed_commands = 0
     for entry in COMMAND_HISTORY:
         elapsed_ms, target, address, command, name = entry
-        if target != BOARD_PROFILE:
+        if target != board_profile:
             continue
         displayed_commands += 1
         print("  %02d. %7.3f s | 0x%02X | %-9s (0x%02X)" %
@@ -849,11 +867,11 @@ def print_test_report(now_ms, start_ms):
 
     print("-" * 64)
     print(" PICO RESPONSES (%d status reads by %s)" %
-          (profile_reads, BOARD_PROFILE))
+          (profile_reads, board_profile))
     displayed_responses = 0
     for entry in RESPONSE_HISTORY:
         first_ms, last_ms, target, address, status, reads = entry
-        if target != BOARD_PROFILE:
+        if target != board_profile:
             continue
         displayed_responses += 1
         feedback = status & 0x0f
@@ -886,12 +904,12 @@ def print_test_report(now_ms, start_ms):
     for key, response in LAST_RESPONSE_BY_TARGET.items():
         target, address = key
         status, _, response_ms = response
-        if target == BOARD_PROFILE:
+        if target == board_profile:
             if profile_result is None or response_ms >= profile_result[0]:
                 profile_result = (response_ms, address, status)
     if profile_result is None:
         print("-" * 64)
-        print(" FINAL %s RESULT" % BOARD_PROFILE)
+        print(" FINAL %s RESULT" % board_profile)
         print("  No status register response was read by the OBC")
     else:
         response_ms, address, status = profile_result
@@ -907,7 +925,7 @@ def print_test_report(now_ms, start_ms):
         else:
             state = "MIXED FEEDBACK"
         print("-" * 64)
-        print(" FINAL %s RESULT" % BOARD_PROFILE)
+        print(" FINAL %s RESULT" % board_profile)
         print("  Address    : 0x%02X" % address)
         print("  Last read  : %.3f s" % (response_ms / 1000))
         print("  Status     : 0x%02X" % status)
@@ -934,119 +952,181 @@ def validate_i2c_target_config(name, i2c_id, address, sda, scl):
         raise ValueError("%s SCL pin %d invalid for I2C%d" % (name, scl, i2c_id))
 
 
-def active_i2c_addresses():
-    address_set = SCENARIOS[ACTIVE_SCENARIO]["address_set"]
+def wait_for_usb_configuration():
+    print("")
+    print("CONFIG_READY")
+    print("Send one JSON configuration line")
+    line = sys.stdin.readline()
+    if line is None:
+        raise ValueError("No USB configuration received")
+    line = line.strip()
+    if not line:
+        raise ValueError("Empty USB configuration")
+    if len(line) > USB_COMMAND_MAX_BYTES:
+        raise ValueError("USB configuration is too long")
+    request = json.loads(line)
+    if not isinstance(request, dict):
+        raise ValueError("USB configuration must be a JSON object")
+    return request
+
+
+def build_session(request):
+    scenario_name = request.get("scenario")
+    if scenario_name not in SCENARIOS:
+        raise ValueError("Unknown scenario: %r" % scenario_name)
+    scenario = dict(SCENARIOS[scenario_name])
+    for field in ("tc1_delay_s", "tc2_delay_s", "power_delay_s",
+                  "uhf_power_delay_s"):
+        if field in request:
+            scenario[field] = request[field]
+    return {
+        "name": scenario_name,
+        "scenario": scenario,
+        "board_profile": request.get("board_profile", BOARD_PROFILE),
+        "duration_s": request.get("duration_s", DEFAULT_SESSION_DURATION_S),
+    }
+
+
+def scenario_i2c_addresses(scenario):
+    address_set = scenario.get("address_set")
     if address_set == "main":
         return PRIMARY_MAIN_ADDRESS, SECONDARY_MAIN_ADDRESS
     if address_set == "redundant":
         return PRIMARY_REDUNDANT_ADDRESS, SECONDARY_REDUNDANT_ADDRESS
     if address_set == "shared":
         return SHARED_UHF_ADDRESS, SHARED_AIS_ADDRESS
-    raise ValueError("Unsupported scenario address_set: %r" % address_set)
+    raise ValueError("Unsupported address_set: %r" % address_set)
 
 
-def validate_config():
-    """Reject configurations that don't make sense for the selected board
-    profile. Raises ValueError; returns True if the config is coherent."""
-    if ACTIVE_SCENARIO not in SCENARIOS:
-        raise ValueError("Unknown ACTIVE_SCENARIO: %r" % ACTIVE_SCENARIO)
-    if BOARD_PROFILE not in ("UHF", "AIS"):
-        raise ValueError("BOARD_PROFILE must be 'UHF' or 'AIS'")
+def _nonnegative_number(value, label):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise ValueError("%s must be a non-negative number" % label)
+
+
+def validate_session(session):
+    scenario_name = session["name"]
+    scenario = session["scenario"]
+    board_profile = session["board_profile"]
+    duration_s = session["duration_s"]
+    if board_profile not in ("UHF", "AIS"):
+        raise ValueError("board_profile must be UHF or AIS")
+    if isinstance(duration_s, bool) or not isinstance(duration_s, (int, float)) or duration_s <= 0:
+        raise ValueError("duration_s must be greater than zero")
     if DRIVER != "register":
         raise ValueError("Only DRIVER='register' is supported")
-    if POLL_MS < 0:
-        raise ValueError("POLL_MS must be >= 0")
-    if REPORT_AFTER_S < 0:
-        raise ValueError("REPORT_AFTER_S must be >= 0")
-    if REPORT_COMMAND_LIMIT < 0:
-        raise ValueError("REPORT_COMMAND_LIMIT must be >= 0")
+    if POLL_MS < 0 or REPORT_COMMAND_LIMIT < 0 or REPORT_RESPONSE_LIMIT < 0:
+        raise ValueError("poll and report limits must be non-negative")
     if not isinstance(REPORT, bool):
         raise ValueError("REPORT must be True or False")
-    if REPORT_RESPONSE_LIMIT < 0:
-        raise ValueError("REPORT_RESPONSE_LIMIT must be >= 0")
 
-    scen = SCENARIOS[ACTIVE_SCENARIO]
-    mode = scen.get("mode")
-    if mode not in (
-        "POWER_ON_ALL", "SEQUENTIAL_TC", "NO_DEPLOY",
-        "SHARED_I2C_DEPLOYMENT", "PAIR_TEST"):
-        raise ValueError("Unsupported scenario mode: %r" % mode)
-    if scen.get("address_set") not in ("main", "redundant", "shared"):
-        raise ValueError(
-            "Scenario address_set must be 'main', 'redundant', or 'shared'")
-    if mode == "POWER_ON_ALL" and scen.get("delay_s", -1) < 0:
-        raise ValueError("POWER_ON_ALL delay_s must be >= 0")
+    mode = scenario.get("mode")
+    if mode not in ("POWER_ON_ALL", "SEQUENTIAL_TC", "NO_DEPLOY",
+                    "PAIR_TEST", "SHARED_I2C_DEPLOYMENT"):
+        raise ValueError("Unsupported mode: %r" % mode)
+    scenario_i2c_addresses(scenario)
+    if mode == "POWER_ON_ALL":
+        _nonnegative_number(scenario.get("delay_s"), "POWER_ON_ALL delay_s")
     if mode in ("SEQUENTIAL_TC", "SHARED_I2C_DEPLOYMENT"):
-        if scen.get("tc1_delay_s", -1) < 0 or scen.get("tc2_delay_s", -1) < 0:
-            raise ValueError("SEQUENTIAL_TC delays must be >= 0")
+        _nonnegative_number(scenario.get("tc1_delay_s"), "tc1_delay_s")
+        _nonnegative_number(scenario.get("tc2_delay_s"), "tc2_delay_s")
     if mode == "PAIR_TEST":
-        if scen.get("power_pair") not in (None, "TC1", "TC2"):
-            raise ValueError("PAIR_TEST power_pair must be None, 'TC1', or 'TC2'")
-        if scen.get("power_pair") is not None and scen.get("power_delay_s", -1) < 0:
-            raise ValueError("PAIR_TEST power_delay_s must be >= 0")
-        for field in ("accept_tc1", "accept_tc2",
-                      "deploy_on_tc1", "deploy_on_tc2"):
-            if not isinstance(scen.get(field), bool):
+        if scenario.get("power_pair") not in (None, "TC1", "TC2"):
+            raise ValueError("PAIR_TEST power_pair must be None, TC1, or TC2")
+        if scenario.get("power_pair") is not None:
+            _nonnegative_number(scenario.get("power_delay_s"), "power_delay_s")
+        for field in ("accept_tc1", "accept_tc2", "deploy_on_tc1", "deploy_on_tc2"):
+            if not isinstance(scenario.get(field), bool):
                 raise ValueError("PAIR_TEST %s must be bool" % field)
-        if scen.get("deploy_on_tc1") and not scen.get("accept_tc1"):
+        if scenario.get("deploy_on_tc1") and not scenario.get("accept_tc1"):
             raise ValueError("PAIR_TEST cannot deploy on a rejected TC1 command")
-        if scen.get("deploy_on_tc2") and not scen.get("accept_tc2"):
+        if scenario.get("deploy_on_tc2") and not scenario.get("accept_tc2"):
             raise ValueError("PAIR_TEST cannot deploy on a rejected TC2 command")
-        if scen.get("tc1_delay_s", -1) < 0 or scen.get("tc2_delay_s", -1) < 0:
-            raise ValueError("PAIR_TEST cutter delays must be >= 0")
+        _nonnegative_number(scenario.get("tc1_delay_s"), "tc1_delay_s")
+        _nonnegative_number(scenario.get("tc2_delay_s"), "tc2_delay_s")
+
     if mode == "SHARED_I2C_DEPLOYMENT":
-        if scen.get("uhf_power_delay_s", -1) < 0:
-            raise ValueError("shared UHF power delay must be >= 0")
-        validate_i2c_target_config(
-            "SHARED", SHARED_I2C_ID, SHARED_UHF_ADDRESS,
-            SHARED_SDA, SHARED_SCL)
-        validate_i2c_target_config(
-            "SHARED", SHARED_I2C_ID, SHARED_AIS_ADDRESS,
-            SHARED_SDA, SHARED_SCL)
+        _nonnegative_number(scenario.get("uhf_power_delay_s"), "uhf_power_delay_s")
+        validate_i2c_target_config("SHARED", SHARED_I2C_ID, SHARED_UHF_ADDRESS, SHARED_SDA, SHARED_SCL)
+        validate_i2c_target_config("SHARED", SHARED_I2C_ID, SHARED_AIS_ADDRESS, SHARED_SDA, SHARED_SCL)
         if DI_PIN in (SHARED_SDA, SHARED_SCL):
             raise ValueError("DI_PIN must not collide with shared I2C GPIOs")
-        if SHARED_HANDOFF_DELAY_MS < 0:
-            raise ValueError("SHARED_HANDOFF_DELAY_MS must be >= 0")
+        _nonnegative_number(SHARED_HANDOFF_DELAY_MS, "SHARED_HANDOFF_DELAY_MS")
         return True
 
-    if BOARD_PROFILE == "AIS" and not DUAL_ADDRESS:
-        raise ValueError(
-            "AIS profile requires DUAL_ADDRESS=True because AIS is served "
-            "by the secondary I2C block")
-
-    primary_address, secondary_address = active_i2c_addresses()
-
-    used_pins = []
-    used_i2c_ids = []
-    used_addresses = []
-    validate_i2c_target_config(
-        "PRIMARY", PRIMARY_I2C_ID, primary_address, PRIMARY_SDA, PRIMARY_SCL)
-    used_i2c_ids.append(PRIMARY_I2C_ID)
-    used_addresses.append(primary_address)
-    used_pins.extend([PRIMARY_SDA, PRIMARY_SCL])
+    if board_profile == "AIS" and not DUAL_ADDRESS:
+        raise ValueError("AIS profile requires DUAL_ADDRESS=True")
+    primary_address, secondary_address = scenario_i2c_addresses(scenario)
+    targets = [("PRIMARY", PRIMARY_I2C_ID, primary_address, PRIMARY_SDA, PRIMARY_SCL)]
     if DUAL_ADDRESS:
-        validate_i2c_target_config(
-            "SECONDARY", SECONDARY_I2C_ID, secondary_address,
-            SECONDARY_SDA, SECONDARY_SCL)
-        used_i2c_ids.append(SECONDARY_I2C_ID)
-        used_addresses.append(secondary_address)
-        used_pins.extend([SECONDARY_SDA, SECONDARY_SCL])
-    if len(set(used_i2c_ids)) != len(used_i2c_ids):
+        targets.append(("SECONDARY", SECONDARY_I2C_ID, secondary_address, SECONDARY_SDA, SECONDARY_SCL))
+    for target in targets:
+        validate_i2c_target_config(*target)
+    ids = [target[1] for target in targets]
+    addresses = [target[2] for target in targets]
+    pins = [pin for target in targets for pin in target[3:5]]
+    if len(set(ids)) != len(ids):
         raise ValueError("AIS and UHF must use different Pico I2C blocks")
-    if len(set(used_addresses)) != len(used_addresses):
+    if len(set(addresses)) != len(addresses):
         raise ValueError("AIS and UHF I2C addresses must differ")
-    if len(set(used_pins)) != len(used_pins):
-        raise ValueError("I2C GPIO assignments must not collide")
-
-    if DI_PIN in used_pins:
-        raise ValueError("DI_PIN must not collide with I2C SDA/SCL GPIOs")
-
-    if BOARD_PROFILE == "AIS" and mode == "POWER_ON_ALL":
-        raise ValueError(
-            "AIS profile never deploys on power-on; pick a TC-triggered "
-            "scenario (ACTIVE_SCENARIO=%r has mode=%r)"
-            % (ACTIVE_SCENARIO, mode))
+    if len(set(pins)) != len(pins) or DI_PIN in pins:
+        raise ValueError("I2C and DI GPIO assignments must not collide")
+    if board_profile == "AIS" and mode == "POWER_ON_ALL":
+        raise ValueError("AIS profile never deploys on power-on (%s)" % scenario_name)
     return True
+
+
+def reset_session_report():
+    global PRIMARY_WRITES, PRIMARY_READS, SECONDARY_WRITES, SECONDARY_READS
+    global COMMAND_HISTORY_DROPPED, RESPONSE_HISTORY_DROPPED
+    PRIMARY_WRITES = PRIMARY_READS = 0
+    SECONDARY_WRITES = SECONDARY_READS = 0
+    COMMAND_HISTORY[:] = []
+    COMMAND_HISTORY_DROPPED = 0
+    RESPONSE_HISTORY[:] = []
+    RESPONSE_HISTORY_DROPPED = 0
+    LAST_RESPONSE_BY_TARGET.clear()
+
+
+def _make_di_pin():
+    if DI_PULL == "up":
+        return machine.Pin(DI_PIN, machine.Pin.IN, machine.Pin.PULL_UP)
+    if DI_PULL == "down":
+        return machine.Pin(DI_PIN, machine.Pin.IN, machine.Pin.PULL_DOWN)
+    return machine.Pin(DI_PIN, machine.Pin.IN)
+
+
+def configure_session_hardware(session):
+    scenario = session["scenario"]
+    primary_address, secondary_address = scenario_i2c_addresses(scenario)
+    slaves = []
+    try:
+        if scenario["mode"] == "SHARED_I2C_DEPLOYMENT":
+            slaves.append(make_slave(
+                SHARED_I2C_ID, primary_address, SHARED_SDA, SHARED_SCL))
+        else:
+            slaves.append(make_slave(
+                PRIMARY_I2C_ID, primary_address, PRIMARY_SDA, PRIMARY_SCL))
+            if DUAL_ADDRESS:
+                slaves.append(make_slave(
+                    SECONDARY_I2C_ID, secondary_address,
+                    SECONDARY_SDA, SECONDARY_SCL))
+        return slaves, _make_di_pin()
+    except Exception:
+        _disable_slaves(slaves)
+        raise
+
+
+def disable_all_i2c_blocks():
+    """Leave both hardware targets inaccessible while awaiting USB config."""
+    for base in (PicoI2CSlave._I2C0_BASE, PicoI2CSlave._I2C1_BASE):
+        machine.mem32[base | PicoI2CSlave._ATOM_CLR |
+                      PicoI2CSlave._IC_ENABLE] = 0x0001
+
+
+def print_session_ack(session, primary_address, secondary_address):
+    print("ACK scenario=%s board=%s primary=0x%02X secondary=0x%02X" %
+          (session["name"], session["board_profile"], primary_address, secondary_address))
+    print("READY_FOR_OBC")
 
 
 def _read_power(di_pin):
@@ -1054,294 +1134,149 @@ def _read_power(di_pin):
     return (level == 1) if DI_ACTIVE_HIGH else (level == 0)
 
 
-def run_shared_i2c_deployment(slave, di):
-    """Serve UHF first, then re-address the same Pico I2C1 block for AIS."""
-    global PRIMARY_WRITES, PRIMARY_READS, SECONDARY_WRITES, SECONDARY_READS
+def _record_response(now, start_ms, target, slave, reg):
     global RESPONSE_HISTORY_DROPPED
-
-    scen = SCENARIOS[ACTIVE_SCENARIO]
-    uhf_sim = DeploymentSim()
-    ais_sim = DeploymentSim()
-    active_target = "UHF"
-    active_sim = uhf_sim
-    handoff_at = None
-    last_power = None
-    last_count_report = time.ticks_ms()
-    test_start_ms = last_count_report
-    report_printed = False
-
-    while True:
-        now = time.ticks_ms()
-        power_on = _read_power(di)
-        if power_on != last_power:
-            if DEBUG:
-                print("[POWER] ANT_POWER_%s" % ("ON" if power_on else "LOW"))
-            last_power = power_on
-
-        for cmd in slave.read_pending():
-            record_obc_command(
-                now, test_start_ms, active_target, slave.address, cmd)
-            if active_target == "UHF":
-                PRIMARY_WRITES += 1
-            else:
-                SECONDARY_WRITES += 1
-
-            if cmd == SIM_RESET_COMMAND:
-                uhf_sim.reset()
-                ais_sim.reset()
-                active_target = "UHF"
-                active_sim = uhf_sim
-                handoff_at = None
-                slave.set_address(SHARED_UHF_ADDRESS)
-                if DEBUG:
-                    print("[RESET] shared sequence returned to UHF 0x%02X"
-                          % SHARED_UHF_ADDRESS)
-            else:
-                active_sim.apply_command(cmd)
-
-        if slave.read_requested():
-            reg = active_sim.assemble()
-            slave.send_byte(reg)
-            if REPORT:
-                response_ms = time.ticks_diff(now, test_start_ms)
-                response_key = (active_target, slave.address)
-                previous = LAST_RESPONSE_BY_TARGET.get(response_key)
-                if previous is not None and previous[0] == reg:
-                    if previous[1] is not None:
-                        response_entry = RESPONSE_HISTORY[previous[1]]
-                        response_entry[1] = response_ms
-                        response_entry[5] += 1
-                    LAST_RESPONSE_BY_TARGET[response_key] = (
-                        reg, previous[1], response_ms)
-                elif len(RESPONSE_HISTORY) < REPORT_RESPONSE_LIMIT:
-                    RESPONSE_HISTORY.append(
-                        [response_ms, response_ms, active_target,
-                         slave.address, reg, 1])
-                    LAST_RESPONSE_BY_TARGET[response_key] = (
-                        reg, len(RESPONSE_HISTORY) - 1, response_ms)
-                else:
-                    RESPONSE_HISTORY_DROPPED += 1
-                    LAST_RESPONSE_BY_TARGET[response_key] = (
-                        reg, None, response_ms)
-            if active_target == "UHF":
-                PRIMARY_READS += 1
-                # Keep 0x45 alive until the OBC has actually received a final
-                # deployed status. Switching when the timer expires would make
-                # that decisive UHF read fail.
-                if uhf_sim.deployed and handoff_at is None:
-                    handoff_at = time.ticks_add(now, SHARED_HANDOFF_DELAY_MS)
-            else:
-                SECONDARY_READS += 1
-            if DEBUG and DEBUG_READS:
-                print("[READ ] %s I2C%d@0x%02X -> 0x%02X"
-                      % (active_target, slave.id, slave.address, reg))
-
-        if active_target == "UHF":
-            uhf_sim.update_shared_uhf(power_on, now, scen)
-        else:
-            ais_sim.update_sequential(power_on, now, scen)
-
-        if (active_target == "UHF" and handoff_at is not None and
-                time.ticks_diff(now, handoff_at) >= 0):
-            slave.set_address(SHARED_AIS_ADDRESS)
-            active_target = "AIS"
-            active_sim = ais_sim
-            handoff_at = None
-            print("[HANDOFF] Pico I2C%d switched UHF 0x%02X -> AIS 0x%02X"
-                  % (slave.id, SHARED_UHF_ADDRESS, SHARED_AIS_ADDRESS))
-
-        if DEBUG_COUNTS and time.ticks_diff(now, last_count_report) >= 7000:
-            print("[I2C_COUNTS] UHF r=%d w=%d | AIS r=%d w=%d"
-                  % (PRIMARY_READS, PRIMARY_WRITES,
-                     SECONDARY_READS, SECONDARY_WRITES))
-            last_count_report = now
-
-        if (REPORT and not report_printed and
-                time.ticks_diff(now, test_start_ms) >= REPORT_AFTER_S * 1000):
-            print_test_report(
-                now,
-                test_start_ms,
-            )
-            report_printed = True
-
-        time.sleep_ms(POLL_MS)
-
-
-def main():
-    global PRIMARY_WRITES, PRIMARY_READS, SECONDARY_WRITES, SECONDARY_READS
-    global COMMAND_HISTORY_DROPPED
-    global RESPONSE_HISTORY_DROPPED
-
-    PRIMARY_WRITES = 0
-    PRIMARY_READS = 0
-    SECONDARY_WRITES = 0
-    SECONDARY_READS = 0
-    COMMAND_HISTORY[:] = []
-    COMMAND_HISTORY_DROPPED = 0
-    RESPONSE_HISTORY[:] = []
-    RESPONSE_HISTORY_DROPPED = 0
-    LAST_RESPONSE_BY_TARGET.clear()
-    validate_config()
-    primary_address, secondary_address = active_i2c_addresses()
-    address_set = SCENARIOS[ACTIVE_SCENARIO]["address_set"]
-
-    print("=" * 64)
-    print(" uhfAntDeploymentSimulator")
-    print(" profile=%s  driver=%s  scenario=%s  address_set=%s  dual_address=%s"
-          % (BOARD_PROFILE, DRIVER, ACTIVE_SCENARIO,
-             address_set, DUAL_ADDRESS))
-
-    # --- bring up slave block(s) -------------------------------------------
-    shared_mode = SCENARIOS[ACTIVE_SCENARIO]["mode"] == "SHARED_I2C_DEPLOYMENT"
-    if shared_mode:
-        slaves = [make_slave(
-            SHARED_I2C_ID, SHARED_UHF_ADDRESS, SHARED_SDA, SHARED_SCL)]
-        print(" shared Pico I2C%d starts UHF @ 0x%02X on SDA=GP%d SCL=GP%d"
-              % (SHARED_I2C_ID, SHARED_UHF_ADDRESS,
-                 SHARED_SDA, SHARED_SCL))
-        print(" handoff target: AIS @ 0x%02X after final UHF status read"
-              % SHARED_AIS_ADDRESS)
-    else:
-        slaves = [make_slave(
-            PRIMARY_I2C_ID, primary_address, PRIMARY_SDA, PRIMARY_SCL)]
-        print(" I2C%d @ 0x%02X on SDA=GP%d SCL=GP%d"
-              % (PRIMARY_I2C_ID, primary_address,
-                 PRIMARY_SDA, PRIMARY_SCL))
-    if DUAL_ADDRESS and not shared_mode:
-        slaves.append(make_slave(SECONDARY_I2C_ID, secondary_address,
-                                 SECONDARY_SDA, SECONDARY_SCL))
-        print(" I2C%d @ 0x%02X on SDA=GP%d SCL=GP%d"
-              % (SECONDARY_I2C_ID, secondary_address,
-                 SECONDARY_SDA, SECONDARY_SCL))
-
-    # --- DI (ANT_POWER) pin -------------------------------------------------
-    if DI_PULL == "up":
-        di = machine.Pin(DI_PIN, machine.Pin.IN, machine.Pin.PULL_UP)
-    elif DI_PULL == "down":
-        di = machine.Pin(DI_PIN, machine.Pin.IN, machine.Pin.PULL_DOWN)
-    else:
-        di = machine.Pin(DI_PIN, machine.Pin.IN)
-    print(" ANT_POWER DI on GP%d (active %s)"
-          % (DI_PIN, "HIGH" if DI_ACTIVE_HIGH else "LOW"))
-    print("=" * 64)
-
-    if shared_mode:
-        run_shared_i2c_deployment(slaves[0], di)
+    if not REPORT:
         return
+    response_ms = time.ticks_diff(now, start_ms)
+    key = (target, slave.address)
+    previous = LAST_RESPONSE_BY_TARGET.get(key)
+    if previous is not None and previous[0] == reg:
+        if previous[1] is not None:
+            entry = RESPONSE_HISTORY[previous[1]]
+            entry[1] = response_ms
+            entry[5] += 1
+        LAST_RESPONSE_BY_TARGET[key] = (reg, previous[1], response_ms)
+    elif len(RESPONSE_HISTORY) < REPORT_RESPONSE_LIMIT:
+        RESPONSE_HISTORY.append([response_ms, response_ms, target, slave.address, reg, 1])
+        LAST_RESPONSE_BY_TARGET[key] = (reg, len(RESPONSE_HISTORY) - 1, response_ms)
+    else:
+        RESPONSE_HISTORY_DROPPED += 1
+        LAST_RESPONSE_BY_TARGET[key] = (reg, None, response_ms)
 
-    primary_sim = DeploymentSim()
-    secondary_sim = DeploymentSim()
-    last_power = None
-    last_count_report = time.ticks_ms()
-    test_start_ms = last_count_report
-    report_printed = False
 
-    # The I2C slave is live regardless of ANT_POWER status.
-    while True:
+def run_normal_session(session, slaves, di):
+    global PRIMARY_WRITES, PRIMARY_READS, SECONDARY_WRITES, SECONDARY_READS
+    primary_sim = DeploymentSim(session["scenario"])
+    secondary_sim = DeploymentSim(session["scenario"])
+    start_ms = time.ticks_ms()
+    duration_ms = session["duration_s"] * 1000
+    last_count_report = start_ms
+    while time.ticks_diff(time.ticks_ms(), start_ms) < duration_ms:
         now = time.ticks_ms()
         power_on = _read_power(di)
-
-        if power_on != last_power:
-            if DEBUG:
-                print("[POWER] ANT_POWER_%s" % ("ON" if power_on else "LOW"))
-            last_power = power_on
-
-        # --- service every slave block -------------------------------------
-        # Primary address / status register
         for cmd in slaves[0].read_pending():
             PRIMARY_WRITES += 1
-            record_obc_command(
-                now, test_start_ms, "UHF", slaves[0].address, cmd)
+            record_obc_command(now, start_ms, "UHF", slaves[0].address, cmd)
             primary_sim.apply_command(cmd)
-
         if slaves[0].read_requested():
             reg = primary_sim.assemble()
             slaves[0].send_byte(reg)
             PRIMARY_READS += 1
-            if REPORT:
-                response_ms = time.ticks_diff(now, test_start_ms)
-                response_key = ("UHF", slaves[0].address)
-                previous = LAST_RESPONSE_BY_TARGET.get(response_key)
-                if previous is not None and previous[0] == reg:
-                    if previous[1] is not None:
-                        response_entry = RESPONSE_HISTORY[previous[1]]
-                        response_entry[1] = response_ms
-                        response_entry[5] += 1
-                    LAST_RESPONSE_BY_TARGET[response_key] = (
-                        reg, previous[1], response_ms)
-                elif len(RESPONSE_HISTORY) < REPORT_RESPONSE_LIMIT:
-                    RESPONSE_HISTORY.append(
-                        [response_ms, response_ms, "UHF",
-                         slaves[0].address, reg, 1])
-                    LAST_RESPONSE_BY_TARGET[response_key] = (
-                        reg, len(RESPONSE_HISTORY) - 1, response_ms)
-                else:
-                    RESPONSE_HISTORY_DROPPED += 1
-                    LAST_RESPONSE_BY_TARGET[response_key] = (
-                        reg, None, response_ms)
-            if DEBUG and DEBUG_READS:
-                print("[READ ] PRIMARY I2C%d@0x%02X -> 0x%02X" %
-                      (slaves[0].id, slaves[0].address, reg))
-
-        # Secondary address / status register
-        if DUAL_ADDRESS:
+            _record_response(now, start_ms, "UHF", slaves[0], reg)
+        if len(slaves) > 1:
             for cmd in slaves[1].read_pending():
                 SECONDARY_WRITES += 1
-                record_obc_command(
-                    now, test_start_ms, "AIS", slaves[1].address, cmd)
+                record_obc_command(now, start_ms, "AIS", slaves[1].address, cmd)
                 secondary_sim.apply_command(cmd)
-
             if slaves[1].read_requested():
                 reg = secondary_sim.assemble()
                 slaves[1].send_byte(reg)
                 SECONDARY_READS += 1
-                if REPORT:
-                    response_ms = time.ticks_diff(now, test_start_ms)
-                    response_key = ("AIS", slaves[1].address)
-                    previous = LAST_RESPONSE_BY_TARGET.get(response_key)
-                    if previous is not None and previous[0] == reg:
-                        if previous[1] is not None:
-                            response_entry = RESPONSE_HISTORY[previous[1]]
-                            response_entry[1] = response_ms
-                            response_entry[5] += 1
-                        LAST_RESPONSE_BY_TARGET[response_key] = (
-                            reg, previous[1], response_ms)
-                    elif len(RESPONSE_HISTORY) < REPORT_RESPONSE_LIMIT:
-                        RESPONSE_HISTORY.append(
-                            [response_ms, response_ms, "AIS",
-                             slaves[1].address, reg, 1])
-                        LAST_RESPONSE_BY_TARGET[response_key] = (
-                            reg, len(RESPONSE_HISTORY) - 1, response_ms)
-                    else:
-                        RESPONSE_HISTORY_DROPPED += 1
-                        LAST_RESPONSE_BY_TARGET[response_key] = (
-                            reg, None, response_ms)
-                if DEBUG and DEBUG_READS:
-                    print("[READ ] SECONDARY I2C%d@0x%02X -> 0x%02X" %
-                          (slaves[1].id, slaves[1].address, reg))
-
+                _record_response(now, start_ms, "AIS", slaves[1], reg)
+        primary_sim.update(power_on, now)
+        if len(slaves) > 1:
+            secondary_sim.update(power_on, now)
         if DEBUG_COUNTS and time.ticks_diff(now, last_count_report) >= 7000:
             print("[I2C_COUNTS] primary r=%d w=%d | secondary r=%d w=%d" %
                   (PRIMARY_READS, PRIMARY_WRITES, SECONDARY_READS, SECONDARY_WRITES))
             last_count_report = now
-
-        # --- run deployment engine -----------------------------------------
-        primary_sim.update(power_on, now)
-        if DUAL_ADDRESS:
-            secondary_sim.update(power_on, now)
-
-        if (REPORT and not report_printed and
-                time.ticks_diff(now, test_start_ms) >= REPORT_AFTER_S * 1000):
-            print_test_report(now, test_start_ms)
-            report_printed = True
-
-        # For I2CTarget memory mode, keep the served buffer in sync with state.
-#        if DRIVER == "i2ctarget":
-#            reg = sim.assemble()
-#            for sl in slaves:
-#                sl.send_byte(reg)
-
         time.sleep_ms(POLL_MS)
+    return start_ms, time.ticks_ms()
+
+
+def run_shared_i2c_deployment(session, slave, di):
+    global PRIMARY_WRITES, PRIMARY_READS, SECONDARY_WRITES, SECONDARY_READS
+    scenario = session["scenario"]
+    uhf_sim = DeploymentSim(scenario)
+    ais_sim = DeploymentSim(scenario)
+    active_target, active_sim = "UHF", uhf_sim
+    handoff_at = None
+    start_ms = time.ticks_ms()
+    duration_ms = session["duration_s"] * 1000
+    while time.ticks_diff(time.ticks_ms(), start_ms) < duration_ms:
+        now = time.ticks_ms()
+        power_on = _read_power(di)
+        for cmd in slave.read_pending():
+            record_obc_command(now, start_ms, active_target, slave.address, cmd)
+            if active_target == "UHF": PRIMARY_WRITES += 1
+            else: SECONDARY_WRITES += 1
+            if cmd == SIM_RESET_COMMAND:
+                uhf_sim.reset(); ais_sim.reset()
+                active_target, active_sim, handoff_at = "UHF", uhf_sim, None
+                slave.set_address(SHARED_UHF_ADDRESS)
+            else:
+                active_sim.apply_command(cmd)
+        if slave.read_requested():
+            reg = active_sim.assemble()
+            slave.send_byte(reg)
+            _record_response(now, start_ms, active_target, slave, reg)
+            if active_target == "UHF":
+                PRIMARY_READS += 1
+                if uhf_sim.deployed and handoff_at is None:
+                    handoff_at = time.ticks_add(now, SHARED_HANDOFF_DELAY_MS)
+            else:
+                SECONDARY_READS += 1
+        if active_target == "UHF":
+            uhf_sim.update_shared_uhf(power_on, now, scenario)
+        else:
+            ais_sim.update_sequential(power_on, now, scenario)
+        if active_target == "UHF" and handoff_at is not None and time.ticks_diff(now, handoff_at) >= 0:
+            slave.set_address(SHARED_AIS_ADDRESS)
+            active_target, active_sim, handoff_at = "AIS", ais_sim, None
+        time.sleep_ms(POLL_MS)
+    return start_ms, time.ticks_ms()
+
+
+def _disable_slaves(slaves):
+    for slave in slaves:
+        slave.disable()
+
+
+def run_session(session):
+    reset_session_report()
+    slaves = []
+    try:
+        slaves, di = configure_session_hardware(session)
+        primary_address, secondary_address = scenario_i2c_addresses(session["scenario"])
+        print_session_ack(session, primary_address, secondary_address)
+        if session["scenario"]["mode"] == "SHARED_I2C_DEPLOYMENT":
+            start_ms, end_ms = run_shared_i2c_deployment(session, slaves[0], di)
+        else:
+            start_ms, end_ms = run_normal_session(session, slaves, di)
+        _disable_slaves(slaves)
+        slaves = []
+        if REPORT:
+            print_test_report(end_ms, start_ms, session)
+        print("SESSION_COMPLETE")
+    finally:
+        _disable_slaves(slaves)
+
+
+def main():
+    disable_all_i2c_blocks()
+    while True:
+        try:
+            request = wait_for_usb_configuration() if USB_SCENARIO_CONTROL else {"scenario": ACTIVE_SCENARIO}
+            session = build_session(request)
+            validate_session(session)
+        except (ValueError, TypeError, KeyError) as error:
+            print("NACK reason=%s" % error)
+            continue
+        try:
+            run_session(session)
+        except Exception as error:
+            print("RUNTIME_ERROR reason=%s" % error)
 
 
 if __name__ == "__main__":
