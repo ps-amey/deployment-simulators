@@ -87,6 +87,10 @@ class SimulatorProfile:
             pins.add(command.current_pin)
         return tuple(sorted(pins))
 
+    @property
+    def has_status_feedback(self) -> bool:
+        return bool(self.feedback_signals)
+
 
 @dataclass(frozen=True)
 class Pulse:
@@ -623,6 +627,8 @@ def configured_deployment_modes(
 def configured_deployment_enables(
     profile: SimulatorProfile, args: argparse.Namespace
 ) -> dict[str, bool]:
+    if not profile.has_status_feedback:
+        return {}
     return {
         unit: getattr(args, f"{unit.lower()}_deployment") == "yes"
         for unit in profile.units
@@ -760,6 +766,8 @@ def print_mapping(profile: SimulatorProfile) -> None:
     for pin, command in profile.command_signals.items():
         print(f"  GP{pin:<2} {command.signal:<20} {command.path}")
     print("Feedback Pico (to OBC inputs):")
+    if not profile.feedback_signals:
+        print("  none")
     for name, feedback in profile.feedback_signals.items():
         print(f"  GP{feedback.pin:<2} {feedback.obc_label:<10} {feedback.signal} ({name})")
     print("External ADC Pico (V/I pulse feedback):")
@@ -821,34 +829,46 @@ def build_parser(profile: SimulatorProfile) -> argparse.ArgumentParser:
         default=DEFAULT_COMMAND_PICO,
         help=f"obc_do Pico serial device (default: {DEFAULT_COMMAND_PICO})",
     )
-    parser.add_argument(
-        "--feedback-pico",
-        default=DEFAULT_FEEDBACK_PICO,
-        help=f"obc_di status Pico serial device (default: {DEFAULT_FEEDBACK_PICO})",
+    parser.set_defaults(
+        feedback_pico=None,
+        leave_feedback=False,
+        stow_feedback=False,
+        stow_after_seconds=0.0,
+        strict_width=False,
+        width_tolerance_ms=WIDTH_TOLERANCE_MS,
     )
+    if profile.has_status_feedback:
+        parser.add_argument(
+            "--feedback-pico",
+            default=DEFAULT_FEEDBACK_PICO,
+            help=f"obc_di status Pico serial device (default: {DEFAULT_FEEDBACK_PICO})",
+        )
     parser.add_argument(
         "--ext-adc-pico",
         default=DEFAULT_EXT_ADC_PICO,
         help=f"obc_ext_adc Pico serial device (default: {DEFAULT_EXT_ADC_PICO})",
     )
-    parser.add_argument("--min-pulse-ms", type=float, default=1.0, help="ignore shorter completed pulses for deployment status (default: 1)")
-    parser.add_argument("--strict-width", action="store_true", help="only assert feedback for pulses matching an expected width")
-    parser.add_argument("--width-tolerance-ms", type=float, default=WIDTH_TOLERANCE_MS, help=f"deployment width tolerance (default: {WIDTH_TOLERANCE_MS:g})")
+    parser.add_argument("--min-pulse-ms", type=float, default=1.0, help="ignore shorter completed pulses (default: 1)")
+    if profile.has_status_feedback:
+        parser.add_argument("--strict-width", action="store_true", help="only assert status feedback for pulses matching an expected width")
+        parser.add_argument("--leave-feedback", action="store_true", help="do not force status feedback low when the program exits")
+        parser.add_argument("--stow-feedback", action="store_true", help="drive all status feedback LOW using only the feedback Pico, then exit")
+        parser.add_argument("--stow-after-seconds", type=float, default=0.0, help="automatically drive status feedback LOW after an accepted deployment")
+    if profile.has_status_feedback:
+        parser.add_argument("--width-tolerance-ms", type=float, default=WIDTH_TOLERANCE_MS, help=f"deployment width tolerance (default: {WIDTH_TOLERANCE_MS:g})")
     parser.add_argument("--log", type=Path, default=profile.default_log)
-    parser.add_argument("--leave-feedback", action="store_true", help="do not force all feedback low when the program exits")
-    parser.add_argument("--stow-feedback", action="store_true", help="drive all feedback LOW using only the feedback Pico, then exit")
-    parser.add_argument("--stow-after-seconds", type=float, default=0.0, help="automatically drive all feedback LOW this many seconds after an accepted deployment (default: disabled)")
     parser.add_argument("--once", action="store_true", help="exit after the first completed non-glitch pulse")
     parser.add_argument("--show-mapping", action="store_true")
     for deployment in profile.units:
         add_deployment_mode_group(parser, deployment)
-    for deployment in profile.units:
-        parser.add_argument(
-            f"--{deployment.lower()}-deployment",
-            required=True,
-            choices=("yes", "no"),
-            help=f"allow {deployment} to contribute to deployment-status output",
-        )
+    if profile.has_status_feedback:
+        for deployment in profile.units:
+            parser.add_argument(
+                f"--{deployment.lower()}-deployment",
+                required=True,
+                choices=("yes", "no"),
+                help=f"allow {deployment} to contribute to deployment-status output",
+            )
     parser.add_argument(
         "--v-ch-feedback",
         required=True,
@@ -965,7 +985,11 @@ def run_dry(profile: SimulatorProfile, args: argparse.Namespace, event_log: Even
     states = {name: False for name in profile.feedback_signals}
     deployment_modes = configured_deployment_modes(profile, args)
     deployment_enables = configured_deployment_enables(profile, args)
-    deployment_gate = build_deployment_gate(profile, deployment_modes)
+    deployment_gate = (
+        build_deployment_gate(profile, deployment_modes)
+        if profile.has_status_feedback
+        else None
+    )
     selected_pins = set(selected_command_pins(profile, deployment_modes))
     selected_pulses = [
         pulse for pulse in args.dry_run_pulses if pulse.pin in selected_pins
@@ -992,6 +1016,30 @@ def run_dry(profile: SimulatorProfile, args: argparse.Namespace, event_log: Even
             signal=profile.command_signals[pulse.pin].signal,
             reason="unselected_command_path",
         )
+    if not profile.has_status_feedback:
+        for pulse in selected_pulses:
+            command = profile.command_signals[pulse.pin]
+            outputs = []
+            if args.v_ch_feedback == "yes":
+                outputs.append(f"V=GP{command.voltage_pin}")
+            if args.i_ch_feedback == "yes":
+                outputs.append(f"I=GP{command.current_pin}")
+            output_text = ", ".join(outputs) if outputs else "V/I disabled"
+            print(f"Detected {command.signal} GP{pulse.pin} ({pulse.width_ms:g} ms); {output_text}")
+            event_log.write(
+                "pulse",
+                signal=command.signal,
+                command_pin=pulse.pin,
+                width_ms=pulse.width_ms,
+                voltage_pin=command.voltage_pin,
+                current_pin=command.current_pin,
+                v_ch_feedback=args.v_ch_feedback,
+                i_ch_feedback=args.i_ch_feedback,
+                status_feedback=False,
+            )
+        print("Dry-run complete: RA status output and milestones are disabled.")
+        return 0
+
     states, events = apply_pulses(
         profile, states,
         selected_pulses,
@@ -1011,7 +1059,8 @@ def run_dry(profile: SimulatorProfile, args: argparse.Namespace, event_log: Even
 
 def run_stow_feedback(profile: SimulatorProfile, args: argparse.Namespace, event_log: EventLog) -> int:
     with RawRepl(args.feedback_pico) as feedback_pico:
-        feedback_pico.enter_raw()
+        if feedback_pico is not None:
+            feedback_pico.enter_raw()
         try:
             drive_low_and_verify(
                 "status Pico",
@@ -1037,7 +1086,7 @@ def cleanup_hardware_picos(
     args: argparse.Namespace,
     event_log: EventLog,
     command_pico: RawRepl,
-    feedback_pico: RawRepl,
+    feedback_pico: RawRepl | None,
     ext_adc_pico: RawRepl | None,
 ) -> None:
     """Best-effort independent cleanup with verified LOW output latches."""
@@ -1049,34 +1098,31 @@ def cleanup_hardware_picos(
         except BaseException as error:
             print(f"WARNING: cleanup event log failed: {error}", file=sys.stderr)
 
-    if not args.leave_feedback:
+    if feedback_pico is not None:
+        if not args.leave_feedback:
+            try:
+                drive_low_and_verify(
+                    "status Pico",
+                    feedback_pico,
+                    tuple(item.pin for item in profile.feedback_signals.values()),
+                )
+                log_cleanup(
+                    "stopped_safe_verified",
+                    states={name: False for name in profile.feedback_signals},
+                )
+                print("Feedback returned to STOWED/LOW and Pico latch verified.")
+            except BaseException as error:
+                failures.append(f"status Pico ({feedback_pico.port}): {error}")
+        else:
+            log_cleanup("stopped_feedback_held")
         try:
-            drive_low_and_verify(
-                "status Pico",
-                feedback_pico,
-                tuple(feedback.pin for feedback in profile.feedback_signals.values()),
-            )
-            log_cleanup(
-                "stopped_safe_verified",
-                states={name: False for name in profile.feedback_signals},
-            )
-            print("Feedback returned to STOWED/LOW and Pico latch verified.")
+            feedback_pico.exit_raw()
         except BaseException as error:
-            failures.append(f"status Pico ({feedback_pico.port}): {error}")
-    else:
-        log_cleanup("stopped_feedback_held")
-    try:
-        feedback_pico.exit_raw()
-    except BaseException as error:
-        failures.append(f"status Pico raw-REPL exit ({feedback_pico.port}): {error}")
+            failures.append(f"status Pico raw-REPL exit ({feedback_pico.port}): {error}")
 
     if ext_adc_pico is not None:
         try:
-            drive_low_and_verify(
-                "external-ADC Pico",
-                ext_adc_pico,
-                profile.ext_adc_pins,
-            )
+            drive_low_and_verify("external-ADC Pico", ext_adc_pico, profile.ext_adc_pins)
             log_cleanup("ext_adc_stopped_safe_verified", output_mask=0)
             print("External ADC V/I feedback returned LOW and Pico latch verified.")
         except BaseException as error:
@@ -1084,9 +1130,7 @@ def cleanup_hardware_picos(
         try:
             ext_adc_pico.exit_raw()
         except BaseException as error:
-            failures.append(
-                f"external-ADC Pico raw-REPL exit ({ext_adc_pico.port}): {error}"
-            )
+            failures.append(f"external-ADC Pico raw-REPL exit ({ext_adc_pico.port}): {error}")
 
     try:
         command_pico.stop_raw_program()
@@ -1122,7 +1166,11 @@ def run_hardware(profile: SimulatorProfile, args: argparse.Namespace, event_log:
     current_enabled = args.i_ch_feedback == "yes"
     ext_adc_enabled = voltage_enabled or current_enabled
     enforce_width = True
-    deployment_gate = build_deployment_gate(profile, deployment_modes)
+    deployment_gate = (
+        build_deployment_gate(profile, deployment_modes)
+        if profile.has_status_feedback
+        else None
+    )
     edge_code = build_edge_stream_code(capture_pins)
     main_red_pairs = configured_main_red_pairs(profile, deployment_modes)
     main_red_attempt_counter = {deployment: 0 for deployment in main_red_pairs}
@@ -1132,10 +1180,9 @@ def run_hardware(profile: SimulatorProfile, args: argparse.Namespace, event_log:
     stream_buffer = b""
     auto_stow_deadline: float | None = None
     simulator_deadline: float | None = None
-    required_devices = {
-        "command Pico": args.command_pico,
-        "status Pico": args.feedback_pico,
-    }
+    required_devices = {"command Pico": args.command_pico}
+    if profile.has_status_feedback:
+        required_devices["status Pico"] = args.feedback_pico
     if ext_adc_enabled:
         required_devices["external-ADC Pico"] = args.ext_adc_pico
     validate_required_pico_paths(required_devices)
@@ -1144,9 +1191,14 @@ def run_hardware(profile: SimulatorProfile, args: argparse.Namespace, event_log:
         print(f"Opening command Pico: {args.command_pico}")
         command_pico = stack.enter_context(RawRepl(args.command_pico))
         print("Command Pico serial port opened.")
-        print(f"Opening status Pico: {args.feedback_pico}")
-        feedback_pico = stack.enter_context(RawRepl(args.feedback_pico))
-        print("Status Pico serial port opened.")
+        feedback_pico = (
+            stack.enter_context(RawRepl(args.feedback_pico))
+            if profile.has_status_feedback
+            else None
+        )
+        if feedback_pico is not None:
+            print(f"Opening status Pico: {args.feedback_pico}")
+            print("Status Pico serial port opened.")
         if ext_adc_enabled:
             print(f"Opening external-ADC Pico: {args.ext_adc_pico}")
         ext_adc_pico = (
@@ -1167,17 +1219,18 @@ def run_hardware(profile: SimulatorProfile, args: argparse.Namespace, event_log:
         )
         print("All required Pico ports opened; safe-output cleanup armed.")
         command_pico.enter_raw()
-        feedback_pico.enter_raw()
+        if feedback_pico is not None:
+            feedback_pico.enter_raw()
         if ext_adc_pico is not None:
             ext_adc_pico.enter_raw()
 
-        # Establish a known-safe status state before V/I setup or edge capture,
-        # even when every deployment output is disabled by the test scenario.
-        drive_low_and_verify(
-            "status Pico",
-            feedback_pico,
-            tuple(feedback.pin for feedback in profile.feedback_signals.values()),
-        )
+        # Establish known-safe status outputs only for status-capable profiles.
+        if feedback_pico is not None:
+            drive_low_and_verify(
+                "status Pico",
+                feedback_pico,
+                tuple(item.pin for item in profile.feedback_signals.values()),
+            )
         if ext_adc_pico is not None:
             ext_adc_pico.execute_raw(build_ext_adc_init_code(profile.ext_adc_pins))
             drive_low_and_verify(
@@ -1202,12 +1255,14 @@ def run_hardware(profile: SimulatorProfile, args: argparse.Namespace, event_log:
             strict_width=enforce_width,
             states=states,
         )
-        print(
+        run_summary = (
             f"Running deployment modes {deployment_modes} on "
             f"{', '.join('GP' + str(pin) for pin in capture_pins)}; "
-            f"V feedback={args.v_ch_feedback}, I feedback={args.i_ch_feedback}, "
-            f"deployment enables={deployment_enables}."
+            f"V feedback={args.v_ch_feedback}, I feedback={args.i_ch_feedback}"
         )
+        if profile.has_status_feedback:
+            run_summary += f", deployment enables={deployment_enables}"
+        print(run_summary + ".")
         try:
             while not stop:
                 assert simulator_deadline is not None
@@ -1351,7 +1406,7 @@ def run_hardware(profile: SimulatorProfile, args: argparse.Namespace, event_log:
                     ]
                     events: list[dict[str, object]] = []
                     feedback_changed = False
-                    if pulses:
+                    if pulses and profile.has_status_feedback:
                         previous_states = dict(states)
                         states, events = apply_pulses(
                             profile, states,
