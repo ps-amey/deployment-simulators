@@ -906,7 +906,7 @@ def validate_args(profile: SimulatorProfile, parser: argparse.ArgumentParser, ar
     special_mode = args.dry_run_pulses is not None or args.stow_feedback
     if not special_mode and not args.command_pico:
         parser.error("--command-pico is required for pulse capture")
-    if not special_mode and not args.feedback_pico:
+    if profile.has_status_feedback and not special_mode and not args.feedback_pico:
         parser.error(
             "--feedback-pico is required to initialize all deployment statuses LOW"
         )
