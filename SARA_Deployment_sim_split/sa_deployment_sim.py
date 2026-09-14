@@ -22,9 +22,9 @@ SA_PROFILE = SimulatorProfile(
     },
     status_requirements={"SA1": ("SA1",), "SA2": ("SA2",)},
     normal_width_ms=50.0,
-    extended_width_ms=80.0,
-    milestone_timeout_s=300.0,
-    simulator_timeout_s=500.0,
+    extended_width_ms=100.0,
+    milestone_timeout_s=200.0,
+    simulator_timeout_s=200.0,
     default_log=Path("sa_deployment_events.jsonl"),
 )
 

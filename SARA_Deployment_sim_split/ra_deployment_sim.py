@@ -18,10 +18,10 @@ RA_PROFILE = SimulatorProfile(
         "RA2": {"main": 5, "red": 7},
     },
     status_requirements={},
-    normal_width_ms=100.0,
-    extended_width_ms=200.0,
-    milestone_timeout_s=500.0,
-    simulator_timeout_s=500.0,
+    normal_width_ms=50.0,
+    extended_width_ms=100.0,
+    milestone_timeout_s=200.0,
+    simulator_timeout_s=200.0,
     default_log=Path("ra_deployment_events.jsonl"),
 )
 

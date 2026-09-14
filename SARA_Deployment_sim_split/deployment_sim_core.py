@@ -34,6 +34,7 @@ PULSE_MODE_PATHS = {
     "main": ("main",),
     "red": ("red",),
     "main-red": ("main", "red"),
+    "all": ("main", "red"),
     "ex-main": ("main",),
     "ex-red": ("red",),
 }
@@ -674,7 +675,11 @@ def qualified_command_state(
             1 << profile.deployment_path_pins[unit][path]
             for path in PULSE_MODE_PATHS[mode]
         )
-        if mode == "main-red":
+        if mode == "all":
+            for bit in selected_bits:
+                if command_state & bit:
+                    qualified |= bit
+        elif mode == "main-red":
             pair_mask = selected_bits[0] | selected_bits[1]
             if command_state & pair_mask == pair_mask:
                 qualified |= pair_mask
@@ -722,6 +727,11 @@ def build_deployment_gate(
         if milestone_started_at[group] is None:
             milestone_started_at[group] = now
         accepted_paths[unit].add(path)
+        if deployment_modes[unit] == "all":
+            # In all-path monitoring mode, either physical path independently
+            # satisfies this unit's milestone. Pulse-width/status rules still
+            # apply separately from immediate V/I edge reproduction.
+            accepted_paths[unit].update(required_paths(unit))
         milestones = {
             required_unit: required_paths(required_unit) <= accepted_paths[required_unit]
             for required_unit in profile.status_requirements[group]
@@ -810,6 +820,7 @@ def add_deployment_mode_group(
         ("main", "main", "accept the main deployment path"),
         ("red", "red", "accept the redundant deployment path"),
         ("main-red", "main-red", "require both main and redundant paths"),
+        ("all", "all", "monitor main and redundant paths independently"),
         ("ex-main", "ex-main", "accept the extended main path (reserved)"),
         ("ex-red", "ex-red", "accept the extended redundant path (reserved)"),
     ):
@@ -820,6 +831,11 @@ def add_deployment_mode_group(
             const=mode,
             help=f"{deployment}: {help_text}",
         )
+
+
+def automatic_log_path(profile: SimulatorProfile) -> Path:
+    timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
+    return Path("logs") / f"{profile.default_log.stem}_{timestamp}.log"
 
 
 def build_parser(profile: SimulatorProfile) -> argparse.ArgumentParser:
@@ -856,7 +872,12 @@ def build_parser(profile: SimulatorProfile) -> argparse.ArgumentParser:
         parser.add_argument("--stow-after-seconds", type=float, default=0.0, help="automatically drive status feedback LOW after an accepted deployment")
     if profile.has_status_feedback:
         parser.add_argument("--width-tolerance-ms", type=float, default=WIDTH_TOLERANCE_MS, help=f"deployment width tolerance (default: {WIDTH_TOLERANCE_MS:g})")
-    parser.add_argument("--log", type=Path, default=profile.default_log)
+    parser.add_argument(
+        "--log",
+        type=Path,
+        default=automatic_log_path(profile),
+        help="event log path (default: a new timestamped .log file under logs/)",
+    )
     parser.add_argument("--once", action="store_true", help="exit after the first completed non-glitch pulse")
     parser.add_argument("--show-mapping", action="store_true")
     for deployment in profile.units:
@@ -1463,7 +1484,19 @@ def run_hardware(profile: SimulatorProfile, args: argparse.Namespace, event_log:
                                 "level": str(edge["level"]).lower(),
                             },
                         )
+                    for pulse in pulses:
+                        mapping = profile.command_signals[pulse.pin]
+                        print(
+                            f"PULSE COMPLETED {mapping.signal} GP{pulse.pin}: "
+                            f"{pulse.width_ms:.3f} ms ({pulse.width_us} us)"
+                        )
                     for pulse in glitches:
+                        mapping = profile.command_signals[pulse.pin]
+                        print(
+                            f"PULSE IGNORED {mapping.signal} GP{pulse.pin}: "
+                            f"{pulse.width_ms:.3f} ms ({pulse.width_us} us), "
+                            f"below minimum {args.min_pulse_ms:g} ms"
+                        )
                         event_log.write(
                             "pulse_glitch_ignored",
                             command_pin=pulse.pin,
@@ -1475,6 +1508,7 @@ def run_hardware(profile: SimulatorProfile, args: argparse.Namespace, event_log:
                         print(
                             f"IGNORED {deployment_unit} "
                             f"{profile.command_signals[pulse.pin].path.upper()} PULSE: "
+                            f"{pulse.width_ms:.3f} ms ({pulse.width_us} us); "
                             "MAIN AND REDUNDANT WERE NOT HIGH TOGETHER"
                         )
                         event_log.write(

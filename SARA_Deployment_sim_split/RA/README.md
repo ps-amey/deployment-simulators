@@ -37,10 +37,13 @@ RA1 and RA2 independently select one mode, so these common pairs can be tested:
 | redundant | main | GP6 and GP5 |
 | redundant | redundant | GP6 and GP7 |
 | main-red | main-red | GP4+GP6 and GP5+GP7 |
+| all | all | GP4 and GP6 independently; GP5 and GP7 independently |
 
 `--raN-ex-main` selects the same physical main input and `--raN-ex-red` selects the same physical redundant input. Because RA status and milestones are disabled, pulse duration is not used to decide any deployment-status output.
 
 For `main-red`, the existing electrical qualification remains: both inputs for that RA unit must be HIGH together before its V/I outputs rise; either input falling returns both corresponding outputs LOW.
+
+For `all`, both physical paths are monitored independently. Each selected V/I output follows its corresponding command input directly, regardless of pulse length or whether the other path is HIGH.
 
 ## V/I output combinations
 
@@ -111,3 +114,59 @@ python3 SARA_Deployment_sim_split/ra_deployment_sim.py \
 Expected result: GP6 is ignored because RA1 main selected GP4; GP5 routes to V GP5/I GP13.
 
 Dry-run cannot represent simultaneous HIGH overlap. Validate `main-red` overlap behavior using the hardware command inputs.
+
+## Numbered hardware test cases
+
+Run these commands from the repository root. The RA simulator verifies command-pulse detection and V/I reproduction only. It has no RA deployment-status output and no `--raN-deployment yes/no` option. Therefore, an accepted RA pulse does not by itself prove deployment; any test that requires a deployment-status assertion must record the RA deployment result as **FAIL/status unavailable**.
+
+Each run automatically creates a new JSON-Lines event log named like `logs/ra_deployment_events_20260915_143025.log`. The filename contains the local date and time. `--log PATH` remains available only when an explicit filename is needed.
+
+### RA01 - main-path pulse and I/V feedback
+
+```bash
+python3 SARA_Deployment_sim_split/ra_deployment_sim.py \
+  --ra1-main --ra2-main \
+  --v-ch-feedback yes --i-ch-feedback yes
+```
+
+Expected: main pulses on GP4 and GP5 reproduce their corresponding V/I feedback and print their measured widths.
+
+### RA02 - redundant-path pulse and I/V feedback
+
+```bash
+python3 SARA_Deployment_sim_split/ra_deployment_sim.py \
+  --ra1-red --ra2-red \
+  --v-ch-feedback yes --i-ch-feedback yes
+```
+
+Expected: redundant pulses on GP6 and GP7 reproduce their corresponding V/I feedback and print their measured widths.
+
+### RA03 - extended-main pulse and I/V feedback
+
+```bash
+python3 SARA_Deployment_sim_split/ra_deployment_sim.py \
+  --ra1-ex-main --ra2-ex-main \
+  --v-ch-feedback yes --i-ch-feedback yes
+```
+
+Expected: extended-main pulses use GP4 and GP5, reproduce their corresponding V/I feedback, and print their measured widths.
+
+### RA04 - extended-redundant pulse and I/V feedback
+
+```bash
+python3 SARA_Deployment_sim_split/ra_deployment_sim.py \
+  --ra1-ex-red --ra2-ex-red \
+  --v-ch-feedback yes --i-ch-feedback yes
+```
+
+Expected: extended-redundant pulses use GP6 and GP7, reproduce their corresponding V/I feedback, and print their measured widths.
+
+### RA05 - observe every main and redundant I/V pulse
+
+```bash
+python3 SARA_Deployment_sim_split/ra_deployment_sim.py \
+  --ra1-all --ra2-all \
+  --v-ch-feedback yes --i-ch-feedback yes
+```
+
+Expected: GP4, GP5, GP6, and GP7 are monitored independently. Every pulse reproduces its corresponding V/I feedback and its measured width is printed, regardless of pulse validity. No RA deployment status is generated; if status assertion is required, record the deployment result as **FAIL/status unavailable**.
