@@ -46,11 +46,14 @@ Each unit independently requires exactly one mode:
 | `--saN-main` | main only | 50 ms |
 | `--saN-red` | redundant only | 50 ms |
 | `--saN-main-red` | main and redundant HIGH together | 50 ms each |
+| `--saN-ex-main-red` | extended main and redundant HIGH together | 100 ms each |
 | `--saN-all` | main and redundant independently | 50 ms each |
-| `--saN-ex-main` | extended main | 80 ms |
-| `--saN-ex-red` | extended redundant | 80 ms |
+| `--saN-ex-main` | extended main | 100 ms |
+| `--saN-ex-red` | extended redundant | 100 ms |
 
 For `main-red`, both inputs must overlap. V/I outputs remain LOW when only one input is HIGH, both selected V/I pairs rise during overlap, and both pulse widths must belong to the same attempt for status completion.
+
+For `ex-main-red`, the same overlap and same-attempt rules apply, but both completed pulses must validate against the 100 ms extended width. With deployment permission `yes`, status is asserted only after both valid pulse widths have been received.
 
 For `all`, main and redundant inputs are monitored independently and each V/I output follows its corresponding input regardless of pulse length. Deployment-status feedback still uses the configured pulse-width and deployment-permission rules.
 
@@ -98,7 +101,7 @@ python3 SARA_Deployment_sim_split/sa_deployment_sim.py \
   --sa1-ex-main --sa2-ex-red \
   --sa1-deployment yes --sa2-deployment yes \
   --v-ch-feedback no --i-ch-feedback yes --strict-width \
-  --dry-run-pulses GP0:80,GP3:80 --log /tmp/sa-extended.jsonl
+  --dry-run-pulses GP0:100,GP3:100 --log /tmp/sa-extended.jsonl
 ```
 
 Invalid width with the default ±15 ms tolerance:
@@ -197,3 +200,14 @@ python3 SARA_Deployment_sim_split/sa_deployment_sim.py \
 ```
 
 Expected: valid pulses from both units reproduce V/I feedback. SA1 deployment status remains LOW and SA1 is **FAIL by test scenario**. SA2 deployment status becomes HIGH after its first valid pulse and SA2 is **PASS**.
+
+### SA08 - deployment through 100 ms main and redundant pulses
+
+```bash
+python3 SARA_Deployment_sim_split/sa_deployment_sim.py \
+  --sa1-ex-main-red --sa2-ex-main-red \
+  --sa1-deployment yes --sa2-deployment yes \
+  --v-ch-feedback yes --i-ch-feedback yes
+```
+
+Expected: each SA unit requires its main and redundant inputs to be HIGH together. Both completed pulses must be valid at 100 ms and belong to the same overlap attempt. Once both widths are accepted, that unit's deployment-status output becomes HIGH.

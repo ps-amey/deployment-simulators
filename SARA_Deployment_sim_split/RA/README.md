@@ -37,11 +37,14 @@ RA1 and RA2 independently select one mode, so these common pairs can be tested:
 | redundant | main | GP6 and GP5 |
 | redundant | redundant | GP6 and GP7 |
 | main-red | main-red | GP4+GP6 and GP5+GP7 |
+| ex-main-red | ex-main-red | GP4+GP6 and GP5+GP7 |
 | all | all | GP4 and GP6 independently; GP5 and GP7 independently |
 
 `--raN-ex-main` selects the same physical main input and `--raN-ex-red` selects the same physical redundant input. Because RA status and milestones are disabled, pulse duration is not used to decide any deployment-status output.
 
 For `main-red`, the existing electrical qualification remains: both inputs for that RA unit must be HIGH together before its V/I outputs rise; either input falling returns both corresponding outputs LOW.
+
+For `ex-main-red`, the same overlap qualification is used with a 100 ms extended pulse width on both lines. RA still produces V/I feedback only and does not assert a deployment-status output.
 
 For `all`, both physical paths are monitored independently. Each selected V/I output follows its corresponding command input directly, regardless of pulse length or whether the other path is HIGH.
 

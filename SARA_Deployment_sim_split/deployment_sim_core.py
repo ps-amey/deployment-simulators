@@ -34,11 +34,12 @@ PULSE_MODE_PATHS = {
     "main": ("main",),
     "red": ("red",),
     "main-red": ("main", "red"),
+    "ex-main-red": ("main", "red"),
     "all": ("main", "red"),
     "ex-main": ("main",),
     "ex-red": ("red",),
 }
-EXTENDED_PULSE_MODES = {"ex-main", "ex-red"}
+EXTENDED_PULSE_MODES = {"ex-main", "ex-red", "ex-main-red"}
 
 EDGE_MARKER = "SARA_EDGE="
 EDGE_OVERFLOW_MARKER = "SARA_EDGE_OVERFLOW="
@@ -660,7 +661,7 @@ def configured_main_red_pairs(
             profile.deployment_path_pins[unit]["red"],
         )
         for unit, mode in deployment_modes.items()
-        if mode == "main-red"
+        if mode in ("main-red", "ex-main-red")
     }
 
 
@@ -679,7 +680,7 @@ def qualified_command_state(
             for bit in selected_bits:
                 if command_state & bit:
                     qualified |= bit
-        elif mode == "main-red":
+        elif mode in ("main-red", "ex-main-red"):
             pair_mask = selected_bits[0] | selected_bits[1]
             if command_state & pair_mask == pair_mask:
                 qualified |= pair_mask
@@ -820,6 +821,7 @@ def add_deployment_mode_group(
         ("main", "main", "accept the main deployment path"),
         ("red", "red", "accept the redundant deployment path"),
         ("main-red", "main-red", "require both main and redundant paths"),
+        ("ex-main-red", "ex-main-red", "require extended main and redundant paths"),
         ("all", "all", "monitor main and redundant paths independently"),
         ("ex-main", "ex-main", "accept the extended main path (reserved)"),
         ("ex-red", "ex-red", "accept the extended redundant path (reserved)"),
@@ -958,6 +960,12 @@ def report_events(events: Sequence[dict[str, object]]) -> None:
             line_name = "EXTENDED MAIN"
         elif configured_mode == "ex-red":
             line_name = "EXTENDED REDUNDANT"
+        elif configured_mode == "ex-main-red":
+            line_name = (
+                "EXTENDED REDUNDANT"
+                if path in ("red", "redundant")
+                else "EXTENDED MAIN"
+            )
         else:
             line_name = "REDUNDANT" if path in ("red", "redundant") else "MAIN"
         if not event["width_valid"]:
@@ -1400,7 +1408,10 @@ def run_hardware(profile: SimulatorProfile, args: argparse.Namespace, event_log:
                     completed_main_red_attempts: set[str] = set()
                     for pulse in snapshot.falling_pulses:
                         deployment_unit = deployment_unit_for_command(profile, pulse.pin)
-                        if deployment_modes[deployment_unit] != "main-red":
+                        if deployment_modes[deployment_unit] not in (
+                            "main-red",
+                            "ex-main-red",
+                        ):
                             overlap_pulses.append(pulse)
                         elif pulse.pin in main_red_attempt_by_pin:
                             overlap_pulses.append(pulse)
@@ -1535,7 +1546,7 @@ def run_hardware(profile: SimulatorProfile, args: argparse.Namespace, event_log:
                         )
                     completed_single_path = any(
                         deployment_modes[deployment_unit_for_command(profile, pulse.pin)]
-                        != "main-red"
+                        not in ("main-red", "ex-main-red")
                         for pulse in pulses
                     )
                     if args.once and (
