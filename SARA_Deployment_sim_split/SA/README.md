@@ -211,3 +211,19 @@ python3 SARA_Deployment_sim_split/sa_deployment_sim.py \
 ```
 
 Expected: each SA unit requires its main and redundant inputs to be HIGH together. Both completed pulses must be valid at 100 ms and belong to the same overlap attempt. Once both widths are accepted, that unit's deployment-status output becomes HIGH.
+
+## Fixed-width test mode
+
+Use `--test-mode --test-pulse-ms WIDTH` with the normal path, channel, and deployment options when the V/I feedback duration must be controlled by the laptop. Rising-edge qualification is unchanged; after a qualified rise, the laptop drives the selected V/I outputs HIGH and returns them LOW after the requested width, without waiting for the OBC falling edge.
+
+Example:
+
+```bash
+python3 SARA_Deployment_sim_split/sa_deployment_sim.py \
+  --sa1-all --sa2-all \
+  --sa1-deployment no --sa2-deployment no \
+  --v-ch-feedback yes --i-ch-feedback yes \
+  --test-mode --test-pulse-ms 30
+```
+
+The OBC falling edge is still measured and logged, and SA deployment-status validation remains based on the measured OBC pulse width and deployment permissions.

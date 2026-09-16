@@ -852,6 +852,8 @@ def build_parser(profile: SimulatorProfile) -> argparse.ArgumentParser:
         leave_feedback=False,
         stow_feedback=False,
         stow_after_seconds=0.0,
+        test_mode=False,
+        test_pulse_ms=None,
         strict_width=False,
         width_tolerance_ms=WIDTH_TOLERANCE_MS,
     )
@@ -867,6 +869,8 @@ def build_parser(profile: SimulatorProfile) -> argparse.ArgumentParser:
         help=f"obc_ext_adc Pico serial device (default: {DEFAULT_EXT_ADC_PICO})",
     )
     parser.add_argument("--min-pulse-ms", type=float, default=1.0, help="ignore shorter completed pulses (default: 1)")
+    parser.add_argument("--test-mode", action="store_true", help="drive selected V/I feedback for a fixed host-timed width after qualification")
+    parser.add_argument("--test-pulse-ms", type=float, help="test-mode V/I feedback width in milliseconds (required with --test-mode)")
     if profile.has_status_feedback:
         parser.add_argument("--strict-width", action="store_true", help="only assert status feedback for pulses matching an expected width")
         parser.add_argument("--leave-feedback", action="store_true", help="do not force status feedback low when the program exits")
@@ -914,6 +918,12 @@ def validate_args(profile: SimulatorProfile, parser: argparse.ArgumentParser, ar
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.stow_after_seconds < 0:
         parser.error("--stow-after-seconds must be non-negative")
+    if args.test_mode and (args.test_pulse_ms is None or args.test_pulse_ms <= 0):
+        parser.error("--test-pulse-ms must be positive when --test-mode is enabled")
+    if not args.test_mode and args.test_pulse_ms is not None:
+        parser.error("--test-pulse-ms requires --test-mode")
+    if args.test_mode and args.dry_run_pulses is not None:
+        parser.error("--test-mode requires hardware pulse capture")
     selected_modes = sum(
         (
             args.dry_run_pulses is not None,
@@ -1205,6 +1215,8 @@ def run_hardware(profile: SimulatorProfile, args: argparse.Namespace, event_log:
     main_red_attempt_counter = {deployment: 0 for deployment in main_red_pairs}
     main_red_attempt_by_pin: dict[int, int] = {}
     active_main_red_units: set[str] = set()
+    previous_qualified_state = 0
+    test_feedback_deadlines: dict[int, float] = {}
     last_ext_adc_mask = 0
     stream_buffer = b""
     auto_stow_deadline: float | None = None
@@ -1278,6 +1290,8 @@ def run_hardware(profile: SimulatorProfile, args: argparse.Namespace, event_log:
             deployment_enables=deployment_enables,
             v_ch_feedback=args.v_ch_feedback,
             i_ch_feedback=args.i_ch_feedback,
+            test_mode=args.test_mode,
+            test_pulse_ms=args.test_pulse_ms,
             capture_pins=capture_pins,
             capture_method="gpio_irq_state_mask",
             simulator_timeout_s=profile.simulator_timeout_s,
@@ -1289,6 +1303,8 @@ def run_hardware(profile: SimulatorProfile, args: argparse.Namespace, event_log:
             f"{', '.join('GP' + str(pin) for pin in capture_pins)}; "
             f"V feedback={args.v_ch_feedback}, I feedback={args.i_ch_feedback}"
         )
+        if args.test_mode:
+            run_summary += f", TEST pulse width={args.test_pulse_ms:g} ms"
         if profile.has_status_feedback:
             run_summary += f", deployment enables={deployment_enables}"
         print(run_summary + ".")
@@ -1308,9 +1324,36 @@ def run_hardware(profile: SimulatorProfile, args: argparse.Namespace, event_log:
                     )
                     stop = True
                     break
-                stream_buffer += command_pico.read_stream(
-                    timeout_s=min(0.1, remaining_s)
+                next_test_deadline = (
+                    min(test_feedback_deadlines.values())
+                    if test_feedback_deadlines
+                    else None
                 )
+                read_timeout = min(0.1, remaining_s)
+                if next_test_deadline is not None:
+                    read_timeout = min(
+                        read_timeout,
+                        max(0.0, next_test_deadline - time.monotonic()),
+                    )
+                stream_buffer += command_pico.read_stream(timeout_s=read_timeout)
+                if test_feedback_deadlines and ext_adc_pico is not None:
+                    now = time.monotonic()
+                    expired_outputs = {
+                        pin
+                        for pin, deadline in test_feedback_deadlines.items()
+                        if deadline <= now
+                    }
+                    if expired_outputs:
+                        expired_mask = sum(1 << pin for pin in expired_outputs)
+                        new_mask = last_ext_adc_mask & ~expired_mask
+                        update_code = build_ext_adc_update_code(
+                            last_ext_adc_mask, new_mask
+                        )
+                        if update_code:
+                            ext_adc_pico.execute_raw(update_code)
+                            last_ext_adc_mask = new_mask
+                        for pin in expired_outputs:
+                            test_feedback_deadlines.pop(pin, None)
                 while b"\n" in stream_buffer:
                     raw_line, stream_buffer = stream_buffer.split(b"\n", 1)
                     line = raw_line.decode("utf-8", errors="replace").strip("\r\x04> ")
@@ -1343,11 +1386,30 @@ def run_hardware(profile: SimulatorProfile, args: argparse.Namespace, event_log:
                     qualified_state = qualified_command_state(
                         profile, snapshot.state_mask, deployment_modes
                     )
-                    desired_ext_adc_mask = ext_adc_mask_for_state(
-                        profile, qualified_state,
-                        voltage_enabled=voltage_enabled,
-                        current_enabled=current_enabled,
-                    )
+                    if args.test_mode:
+                        newly_qualified_state = (
+                            qualified_state & ~previous_qualified_state
+                        )
+                        test_started_at = time.monotonic()
+                        for pin, command in profile.command_signals.items():
+                            if not newly_qualified_state & (1 << pin):
+                                continue
+                            deadline = test_started_at + args.test_pulse_ms / 1000.0
+                            if voltage_enabled:
+                                test_feedback_deadlines[command.voltage_pin] = deadline
+                            if current_enabled:
+                                test_feedback_deadlines[command.current_pin] = deadline
+                        desired_ext_adc_mask = last_ext_adc_mask
+                        for output_pin, deadline in test_feedback_deadlines.items():
+                            if deadline > test_started_at:
+                                desired_ext_adc_mask |= 1 << output_pin
+                    else:
+                        desired_ext_adc_mask = ext_adc_mask_for_state(
+                            profile, qualified_state,
+                            voltage_enabled=voltage_enabled,
+                            current_enabled=current_enabled,
+                        )
+                    previous_qualified_state = qualified_state
                     ext_update_ms: float | None = None
                     if (
                         ext_adc_pico is not None

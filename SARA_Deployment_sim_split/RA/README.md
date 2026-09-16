@@ -173,3 +173,18 @@ python3 SARA_Deployment_sim_split/ra_deployment_sim.py \
 ```
 
 Expected: GP4, GP5, GP6, and GP7 are monitored independently. Every pulse reproduces its corresponding V/I feedback and its measured width is printed, regardless of pulse validity. No RA deployment status is generated; if status assertion is required, record the deployment result as **FAIL/status unavailable**.
+
+## Fixed-width test mode
+
+Use `--test-mode --test-pulse-ms WIDTH` with the normal path and channel options when the V/I feedback duration must be controlled by the laptop. Rising-edge qualification is unchanged; after a qualified rise, the laptop drives the selected V/I outputs HIGH and returns them LOW after the requested width, without waiting for the OBC falling edge.
+
+Example:
+
+```bash
+python3 SARA_Deployment_sim_split/ra_deployment_sim.py \
+  --ra1-all --ra2-all \
+  --v-ch-feedback yes --i-ch-feedback yes \
+  --test-mode --test-pulse-ms 30
+```
+
+RA still has no deployment-status output. OBC falling edges continue to be measured and logged independently.
