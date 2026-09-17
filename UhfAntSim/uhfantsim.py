@@ -76,13 +76,13 @@ SECONDARY_REDUNDANT_ADDRESS = 0x48  # AIS DCS2/backup
 SECONDARY_SDA    = 26        # GP26 (I2C1 SDA pins: 2,6,10,14,18,26)
 SECONDARY_SCL    = 27        # GP27 (I2C1 SCL pins: 3,7,11,15,19,27)
 
-# shared_i2c_deployment uses only Pico I2C1. It starts as UHF main (0x45)
+# shared_i2c_deployment uses only Pico I2C0. It starts as UHF main (0x45)
 # and, after serving the final UHF deployed status, re-addresses the same
 # hardware block as AIS main (0x47). The harness must put both OBC transactions
 # on this physical bus; software cannot bridge two electrically separate buses.
-SHARED_I2C_ID = 1
-SHARED_SDA = 26
-SHARED_SCL = 27
+SHARED_I2C_ID = 0
+SHARED_SDA = 20
+SHARED_SCL = 21
 SHARED_UHF_ADDRESS = PRIMARY_MAIN_ADDRESS
 SHARED_AIS_ADDRESS = SECONDARY_MAIN_ADDRESS
 SHARED_HANDOFF_DELAY_MS = 20
@@ -239,8 +239,8 @@ SCENARIOS = {
         "tc2_delay_s": TC2_DEPLOY_DELAY_S,
         "address_set": "main",
     },
-    # Power-on alone does nothing. Only TC1 is accepted on red addr and deploys ANT1/ANT2.
-    # power-on deploys tc2 pair
+    # Power-on deploys the TC2 pair on redundant addresses. Only TC1 is
+    # accepted afterward and deploys ANT1/ANT2.
     "test10_power_tc2_deploy_then_tc1_at_red": {
         "mode": "PAIR_TEST",
         "power_pair": "TC2",
@@ -253,8 +253,8 @@ SCENARIOS = {
         "tc2_delay_s": TC2_DEPLOY_DELAY_S,
         "address_set": "redundant",
     },
-    # Power-on alone does nothing. Only TC2 is accepted on red addrnand deploys ANT3/ANT4.
-    # power-on deploys tc1.
+    # Power-on deploys the TC1 pair on redundant addresses. Only TC2 is
+    # accepted afterward and deploys ANT3/ANT4.
     "test11_power_tc1_deploy_then_tc2_at_red": {
         "mode": "PAIR_TEST",
         "power_pair": "TC1",
@@ -350,6 +350,12 @@ TEST_COMMAND_LOOKUP = {
     "test16": "redundant_deploy",
     "test17": "shared_i2c_deployment",
 }
+
+# AIS-only aliases use the same scenario mechanics, but select the AIS target
+# and its redundant address set.  AIS scenarios intentionally exclude the
+# shared-bus test (ais17); that behavior is covered by test17.
+for _index in range(1, 17):
+    TEST_COMMAND_LOOKUP["ais%02d" % _index] = TEST_COMMAND_LOOKUP["test%02d" % _index]
 
 ACTIVE_SCENARIO = "test02_sequential_deploy"
 
@@ -983,7 +989,11 @@ def wait_for_usb_configuration():
     scenario_name = TEST_COMMAND_LOOKUP.get(command)
     if scenario_name is None:
         raise ValueError("Unknown test command: %s" % command)
-    return {"command_id": command, "scenario": scenario_name}
+    return {
+        "command_id": command,
+        "scenario": scenario_name,
+        "board_profile": "AIS" if command.startswith("ais") else "UHF",
+    }
 
 
 def build_session(request):
@@ -1004,12 +1014,16 @@ def build_session(request):
     }
 
 
-def scenario_i2c_addresses(scenario):
+def scenario_i2c_addresses(scenario, board_profile=BOARD_PROFILE):
     address_set = scenario.get("address_set")
     if address_set == "main":
-        return PRIMARY_MAIN_ADDRESS, SECONDARY_MAIN_ADDRESS
+        return ((SECONDARY_MAIN_ADDRESS, SECONDARY_REDUNDANT_ADDRESS)
+                if board_profile == "AIS" else
+                (PRIMARY_MAIN_ADDRESS, SECONDARY_MAIN_ADDRESS))
     if address_set == "redundant":
-        return PRIMARY_REDUNDANT_ADDRESS, SECONDARY_REDUNDANT_ADDRESS
+        return ((SECONDARY_REDUNDANT_ADDRESS, SECONDARY_REDUNDANT_ADDRESS)
+                if board_profile == "AIS" else
+                (PRIMARY_REDUNDANT_ADDRESS, SECONDARY_REDUNDANT_ADDRESS))
     if address_set == "shared":
         return SHARED_UHF_ADDRESS, SHARED_AIS_ADDRESS
     raise ValueError("Unsupported address_set: %r" % address_set)
@@ -1040,7 +1054,7 @@ def validate_session(session):
     if mode not in ("POWER_ON_ALL", "SEQUENTIAL_TC", "NO_DEPLOY",
                     "PAIR_TEST", "SHARED_I2C_DEPLOYMENT"):
         raise ValueError("Unsupported mode: %r" % mode)
-    scenario_i2c_addresses(scenario)
+    scenario_i2c_addresses(scenario, board_profile)
     if mode == "POWER_ON_ALL":
         _nonnegative_number(scenario.get("delay_s"), "POWER_ON_ALL delay_s")
     if mode in ("SEQUENTIAL_TC", "SHARED_I2C_DEPLOYMENT"):
@@ -1070,11 +1084,9 @@ def validate_session(session):
         _nonnegative_number(SHARED_HANDOFF_DELAY_MS, "SHARED_HANDOFF_DELAY_MS")
         return True
 
-    if board_profile == "AIS" and not DUAL_ADDRESS:
-        raise ValueError("AIS profile requires DUAL_ADDRESS=True")
-    primary_address, secondary_address = scenario_i2c_addresses(scenario)
+    primary_address, secondary_address = scenario_i2c_addresses(scenario, board_profile)
     targets = [("PRIMARY", PRIMARY_I2C_ID, primary_address, PRIMARY_SDA, PRIMARY_SCL)]
-    if DUAL_ADDRESS:
+    if DUAL_ADDRESS and board_profile != "AIS":
         targets.append(("SECONDARY", SECONDARY_I2C_ID, secondary_address, SECONDARY_SDA, SECONDARY_SCL))
     for target in targets:
         validate_i2c_target_config(*target)
@@ -1087,8 +1099,6 @@ def validate_session(session):
         raise ValueError("AIS and UHF I2C addresses must differ")
     if len(set(pins)) != len(pins) or DI_PIN in pins:
         raise ValueError("I2C and DI GPIO assignments must not collide")
-    if board_profile == "AIS" and mode == "POWER_ON_ALL":
-        raise ValueError("AIS profile never deploys on power-on (%s)" % scenario_name)
     return True
 
 
@@ -1114,16 +1124,24 @@ def _make_di_pin():
 
 def configure_session_hardware(session):
     scenario = session["scenario"]
-    primary_address, secondary_address = scenario_i2c_addresses(scenario)
+    board_profile = session["board_profile"]
+    primary_address, secondary_address = scenario_i2c_addresses(scenario, board_profile)
     slaves = []
     try:
         if scenario["mode"] == "SHARED_I2C_DEPLOYMENT":
             slaves.append(make_slave(
                 SHARED_I2C_ID, primary_address, SHARED_SDA, SHARED_SCL))
         else:
-            slaves.append(make_slave(
-                PRIMARY_I2C_ID, primary_address, PRIMARY_SDA, PRIMARY_SCL))
-            if DUAL_ADDRESS:
+            if board_profile == "AIS":
+                # The bench exposes only Pico I2C0 for AIS.  Select either
+                # main (0x47) or redundant (0x48) for this session; the OBC
+                # exercises fallback by trying the other address first.
+                slaves.append(make_slave(
+                    PRIMARY_I2C_ID, primary_address, PRIMARY_SDA, PRIMARY_SCL))
+            else:
+                slaves.append(make_slave(
+                    PRIMARY_I2C_ID, primary_address, PRIMARY_SDA, PRIMARY_SCL))
+            if DUAL_ADDRESS and board_profile != "AIS":
                 slaves.append(make_slave(
                     SECONDARY_I2C_ID, secondary_address,
                     SECONDARY_SDA, SECONDARY_SCL))

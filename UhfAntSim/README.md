@@ -1,6 +1,6 @@
 # UHF/AIS Antenna Deployment Simulator
 
-`uhfantsim.py` runs on a Raspberry Pi Pico using MicroPython. The Pico acts as
+`uhfAntSim.py` runs on a Raspberry Pi Pico using MicroPython. The Pico acts as
 an I2C target and emulates the status/command register used by the UHF and AIS
 antenna deployment boards.
 
@@ -188,14 +188,35 @@ the full internal scenario name even though the laptop selects it by short ID.
 | `test14` | `test14_redundant_tc1_ignored_tc2_deploy` | Redundant | TC1 rejected; TC2 deploys Pair 2 |
 | `test15` | `test15_redundant_ignore_all` | Redundant | Both cutter commands rejected |
 | `test16` | `redundant_deploy` | Redundant | Normal sequential behavior on redundant addresses |
-| `test17` | `shared_i2c_deployment` | Shared | I2C1 starts as UHF `0x45`, then hands off to AIS `0x47` |
+| `test17` | `shared_i2c_deployment` | Shared | I2C0 starts as UHF `0x45`, then hands off to AIS `0x47` |
 
 Main sessions expose UHF `0x45` and AIS `0x47`. Redundant sessions expose UHF
 `0x46` and AIS `0x48`.
 
+### AIS-only scenarios
+
+The same simulator also accepts `ais01` through `ais16` for AIS-focused runs.
+These commands reuse the corresponding scenario behavior above, select the AIS
+target in the GDS event stream, and expose only one AIS controller address on
+Pico I²C0 (main `0x47` for `ais01`–`ais09` and redundant `0x48` for
+`ais10`–`ais16`). `ais17` is intentionally not defined because `test17` already
+covers the shared-I²C UHF-to-AIS handoff. The AIS runner defaults the HIL
+`obc_di` control pin to GP26; override it with `--test-flight-pin` if the bench
+wiring differs.
+
+Example:
+
+```bash
+python3 tools/uhfAntDeploymentSim/run_uhf_hil_test.py \
+  --ais02 \
+  --pico-port /dev/ttyACM6 \
+  --gds-tty /dev/piersight-hil/inspace-obc-pico-hil-1/obc-gds-uart \
+  --tts-port 50050
+```
+
 ## Shared-I2C behavior
 
-`test17` uses only Pico I2C1 on GP26/GP27. It begins as UHF at `0x45`. The Pico
+`test17` uses only Pico I2C0 on GP20/GP21. It begins as UHF at `0x45`. The Pico
 keeps that address until the OBC reads the final UHF deployed status, waits the
 configured handoff guard interval, and changes the same hardware block to AIS
 at `0x47`. The harness must route both OBC transactions to this physical bus;
@@ -214,6 +235,47 @@ disables every I2C target and then prints the report over USB. The report:
 
 Set `REPORT = False` to disable collection and printing. The finite session
 still ends after `DEFAULT_SESSION_DURATION_S`.
+
+## Running through the OBC HIL controller
+
+Copy `uhfAntSim.py` to the Pico as `main.py`, then run the host-side HIL
+controller from this `obc_fsw` checkout. Select one scenario with `--01`
+through `--17`:
+
+```bash
+cd /home/fsw-test/FSW/obc_fsw
+python3 tools/uhfAntDeploymentSim/run_uhf_hil_test.py \
+  --01 \
+  --pico-port /dev/ttyACM6 \
+  --gds-tty /dev/piersight-hil/inspace-obc-pico-hil-1/obc-gds-uart \
+  --tts-port 50050 \
+  --xds-tty /dev/hidraw4
+```
+
+The runner sends `test01\r\n` to the Pico at 115200 baud, requires
+`ACK=test01`, starts the HIL `gds` wrapper (which configures and launches
+F Prime GDS), connects an F Prime
+`IntegrationTestAPI` client, sets `obc_di` pin 16 high, verifies its readback,
+then flashes and boots the OBC and waits for the decoded UHF
+`AntennaDeploymentStatusEvent`. It always returns pin 16 low before exiting.
+Logs are written below `build-artifacts/uhf-ant-sim/`.
+
+Skip OBC flashing and boot when the required image is already running:
+
+```bash
+python3 tools/uhfAntDeploymentSim/run_uhf_hil_test.py \
+  --02 \
+  --pico-port /dev/ttyACM6 \
+  --gds-tty /dev/piersight-hil/inspace-obc-pico-hil-1/obc-gds-uart \
+  --tts-port 50050 \
+  --no-boot
+```
+
+Use `--pico-port` to select the Pico USB serial device and `--gds-tty` to
+select the OBC GDS UART. The default Pico baud is 115200; GDS transport settings
+are resolved by the HIL wrapper. Use `--bootloader`, `--app-image`, and `--metadata` to override
+the default images under
+`build-artifacts/TMS570/OBC_FSW_Deployments_OBC/bin/`.
 
 ## Bench checks
 
