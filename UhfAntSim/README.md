@@ -188,7 +188,7 @@ the full internal scenario name even though the laptop selects it by short ID.
 | `test14` | `test14_redundant_tc1_ignored_tc2_deploy` | Redundant | TC1 rejected; TC2 deploys Pair 2 |
 | `test15` | `test15_redundant_ignore_all` | Redundant | Both cutter commands rejected |
 | `test16` | `redundant_deploy` | Redundant | Normal sequential behavior on redundant addresses |
-| `test17` | `shared_i2c_deployment` | Shared | I2C0 starts as UHF `0x45`, then hands off to AIS `0x47` |
+| `test17` | `shared_i2c_deployment` | Shared | UHF and AIS ignore power-only deployment and require TC1 then TC2; I2C0 hands off from `0x45` to `0x47` |
 
 Main sessions expose UHF `0x45` and AIS `0x47`. Redundant sessions expose UHF
 `0x46` and AIS `0x48`.
@@ -217,10 +217,13 @@ python3 tools/uhfAntDeploymentSim/run_uhf_hil_test.py \
 ## Shared-I2C behavior
 
 `test17` uses only Pico I2C0 on GP20/GP21. It begins as UHF at `0x45`. The Pico
-keeps that address until the OBC reads the final UHF deployed status, waits the
-configured handoff guard interval, and changes the same hardware block to AIS
-at `0x47`. The harness must route both OBC transactions to this physical bus;
-the simulator cannot bridge separate buses.
+does not deploy UHF from power alone: TC1 must deploy ANT1/ANT2 and TC2 must
+then deploy ANT3/ANT4. It keeps `0x45` until the OBC reads the final UHF
+deployed status, waits the configured handoff guard interval, and changes the
+same hardware block to AIS at `0x47`. AIS starts with all antennas stored and
+also requires TC1 followed by TC2; power alone does not deploy it. The harness
+must route both OBC transactions to this physical bus; the simulator cannot
+bridge separate buses.
 
 ## Report behavior
 

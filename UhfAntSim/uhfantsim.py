@@ -87,9 +87,9 @@ SHARED_UHF_ADDRESS = PRIMARY_MAIN_ADDRESS
 SHARED_AIS_ADDRESS = SECONDARY_MAIN_ADDRESS
 SHARED_HANDOFF_DELAY_MS = 20
 
-# True exercises successful UHF power-on deployment. False leaves UHF stored
-# during the OBC's power-on poll so that the OBC proceeds to TC1 then TC2.
-SHARED_UHF_POWER_DEPLOY_SUCCESS = True
+# Shared mode keeps both boards stored on power alone. UHF therefore proceeds
+# through the TC1/TC2 fallback, matching the AIS TC-only sequence after handoff.
+SHARED_UHF_POWER_DEPLOY_SUCCESS = False
 
 INTERNAL_PULLUPS =True
 # Bus data rate is set by the MASTER (target 100 kHz). A slave does not drive
