@@ -22,9 +22,15 @@ python3 SARA_Deployment_sim_split/ra_deployment_sim.py \
   --v-ch-feedback yes --i-ch-feedback yes
 ```
 
+To keep the simulator running until Ctrl+C, add:
+
+```bash
+--simulator-timeout none
+```
+
 Only the command Pico and external-ADC Pico are opened. When both V and I feedback are `no`, only the command Pico is opened.
 
-Use `Ctrl+C` to stop. All owned external-ADC pins are returned LOW and verified. The simulator also cleans up after its 500-second runtime limit.
+Use `Ctrl+C` to stop. All owned external-ADC pins are returned LOW and verified. By default, the simulator also cleans up after its 200-second runtime limit; use `--simulator-timeout none` to disable that limit.
 
 ## RA input-path combinations
 

@@ -23,6 +23,12 @@ python3 SARA_Deployment_sim_split/sa_deployment_sim.py \
   --v-ch-feedback yes --i-ch-feedback yes
 ```
 
+To keep the simulator running until Ctrl+C, add:
+
+```bash
+--simulator-timeout none
+```
+
 To use explicit device paths:
 
 ```bash
@@ -35,7 +41,7 @@ python3 SARA_Deployment_sim_split/sa_deployment_sim.py \
   --v-ch-feedback yes --i-ch-feedback yes
 ```
 
-Use `Ctrl+C` to stop. Owned V/I and status outputs are returned LOW and verified unless `--leave-feedback` is selected for status outputs. The simulator also cleans up after its 500-second runtime limit.
+Use `Ctrl+C` to stop. Owned V/I and status outputs are returned LOW and verified unless `--leave-feedback` is selected for status outputs. By default, the simulator also cleans up after its 200-second runtime limit; use `--simulator-timeout none` to disable that limit.
 
 ## Mode combinations
 

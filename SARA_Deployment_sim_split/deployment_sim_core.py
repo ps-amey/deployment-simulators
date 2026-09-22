@@ -840,6 +840,20 @@ def automatic_log_path(profile: SimulatorProfile) -> Path:
     return Path("logs") / f"{profile.default_log.stem}_{timestamp}.log"
 
 
+def parse_simulator_timeout(value: str) -> float | None:
+    if value.lower() == "none":
+        return None
+    try:
+        timeout_s = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "must be a positive number or 'none'"
+        ) from error
+    if timeout_s <= 0:
+        raise argparse.ArgumentTypeError("must be positive or 'none'")
+    return timeout_s
+
+
 def build_parser(profile: SimulatorProfile) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=profile.name)
     parser.add_argument(
@@ -883,6 +897,17 @@ def build_parser(profile: SimulatorProfile) -> argparse.ArgumentParser:
         type=Path,
         default=automatic_log_path(profile),
         help="event log path (default: a new timestamped .log file under logs/)",
+    )
+    parser.add_argument(
+        "--simulator-timeout",
+        dest="simulator_timeout_s",
+        type=parse_simulator_timeout,
+        default="default",
+        metavar="SECONDS|none",
+        help=(
+            "override the whole simulator runtime; use 'none' to run until "
+            f"Ctrl+C (default: {profile.simulator_timeout_s:g} seconds)"
+        ),
     )
     parser.add_argument("--once", action="store_true", help="exit after the first completed non-glitch pulse")
     parser.add_argument("--show-mapping", action="store_true")
@@ -1280,7 +1305,12 @@ def run_hardware(profile: SimulatorProfile, args: argparse.Namespace, event_log:
                 profile.ext_adc_pins,
             )
         command_pico.start_raw_program(edge_code)
-        simulator_deadline = time.monotonic() + profile.simulator_timeout_s
+        simulator_timeout_s = args.simulator_timeout_s
+        simulator_deadline = (
+            None
+            if simulator_timeout_s is None
+            else time.monotonic() + simulator_timeout_s
+        )
         event_log.write(
             "started",
             command_pico=args.command_pico,
@@ -1294,7 +1324,7 @@ def run_hardware(profile: SimulatorProfile, args: argparse.Namespace, event_log:
             test_pulse_ms=args.test_pulse_ms,
             capture_pins=capture_pins,
             capture_method="gpio_irq_state_mask",
-            simulator_timeout_s=profile.simulator_timeout_s,
+            simulator_timeout_s=simulator_timeout_s,
             strict_width=enforce_width,
             states=states,
         )
@@ -1310,16 +1340,19 @@ def run_hardware(profile: SimulatorProfile, args: argparse.Namespace, event_log:
         print(run_summary + ".")
         try:
             while not stop:
-                assert simulator_deadline is not None
-                remaining_s = simulator_deadline - time.monotonic()
-                if remaining_s <= 0:
+                remaining_s = (
+                    None
+                    if simulator_deadline is None
+                    else simulator_deadline - time.monotonic()
+                )
+                if remaining_s is not None and remaining_s <= 0:
                     print(
-                        f"SIMULATOR TIMER EXCEEDED ({profile.simulator_timeout_s:g} s); "
+                        f"SIMULATOR TIMER EXCEEDED ({simulator_timeout_s:g} s); "
                         "BEGINNING CLEANUP"
                     )
                     event_log.write(
                         "simulator_timeout",
-                        timeout_s=profile.simulator_timeout_s,
+                        timeout_s=simulator_timeout_s,
                         states=states,
                     )
                     stop = True
@@ -1329,7 +1362,7 @@ def run_hardware(profile: SimulatorProfile, args: argparse.Namespace, event_log:
                     if test_feedback_deadlines
                     else None
                 )
-                read_timeout = min(0.1, remaining_s)
+                read_timeout = 0.1 if remaining_s is None else min(0.1, remaining_s)
                 if next_test_deadline is not None:
                     read_timeout = min(
                         read_timeout,
@@ -1646,6 +1679,8 @@ def run_hardware(profile: SimulatorProfile, args: argparse.Namespace, event_log:
 def run_cli(profile: SimulatorProfile, argv: Sequence[str] | None = None) -> int:
     parser = build_parser(profile)
     args = parser.parse_args(argv)
+    if args.simulator_timeout_s == "default":
+        args.simulator_timeout_s = profile.simulator_timeout_s
     if args.show_mapping:
         print_mapping(profile)
         if (
