@@ -232,9 +232,11 @@ histories during the session. Once the session duration expires, it first
 disables every I2C target and then prints the report over USB. The report:
 
 1. Uses the full internal scenario name.
-2. Filters commands and responses using `BOARD_PROFILE`.
-3. Compresses repeated identical responses and includes their read count.
-4. Uses the last status byte actually returned to the OBC as the final result.
+2. Filters normal-session output using `BOARD_PROFILE`.
+3. Prints separate UHF and AIS command, response, and final-result sections for
+   shared `test17` sessions.
+4. Compresses repeated identical responses and includes their read count.
+5. Uses the last status byte actually returned to each board as its final result.
 
 Set `REPORT = False` to disable collection and printing. The finite session
 still ends after `DEFAULT_SESSION_DURATION_S`.

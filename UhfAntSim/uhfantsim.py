@@ -849,34 +849,26 @@ def record_obc_command(now_ms, start_ms, target, address, command):
         COMMAND_HISTORY_DROPPED += 1
 
 
-def print_test_report(now_ms, start_ms, session):
-    """Print a concise report for this completed session on USB serial."""
-    elapsed_s = time.ticks_diff(now_ms, start_ms) / 1000
-    scenario_name = session["name"]
-    scenario = session["scenario"]
-    board_profile = session["board_profile"]
-    profile_writes = (PRIMARY_WRITES if board_profile == "UHF"
-                      else SECONDARY_WRITES)
-    profile_reads = (PRIMARY_READS if board_profile == "UHF"
-                     else SECONDARY_READS)
+def _deployment_state(status):
+    feedback = status & 0x0f
+    if feedback == 0x0f:
+        return "ALL STORED"
+    if feedback == 0x0c:
+        return "TC1 PAIR DEPLOYED"
+    if feedback == 0x03:
+        return "TC2 PAIR DEPLOYED"
+    if feedback == 0x00:
+        return "ALL DEPLOYED"
+    return "MIXED FEEDBACK"
 
-    print("")
-    print("=" * 64)
-    print(" ANTENNA DEPLOYMENT TEST REPORT")
-    print("=" * 64)
-    print(" Test       : %s" % scenario_name)
-    print(" Mode       : %s" % scenario["mode"])
-    print(" Board      : %s" % board_profile)
-    print(" Addresses  : %s" % scenario["address_set"])
-    print(" Elapsed    : %.3f s" % elapsed_s)
 
+def _print_target_report(target, writes, reads):
     print("-" * 64)
-    print(" OBC COMMANDS (%d received by %s)" %
-          (profile_writes, board_profile))
+    print(" %s OBC COMMANDS (%d received)" % (target, writes))
     displayed_commands = 0
     for entry in COMMAND_HISTORY:
-        elapsed_ms, target, address, command, name = entry
-        if target != board_profile:
+        elapsed_ms, entry_target, address, command, name = entry
+        if entry_target != target:
             continue
         displayed_commands += 1
         print("  %02d. %7.3f s | 0x%02X | %-9s (0x%02X)" %
@@ -884,83 +876,83 @@ def print_test_report(now_ms, start_ms, session):
                address, name, command))
     if displayed_commands == 0:
         print("  None recorded")
+
+    print("-" * 64)
+    print(" %s PICO RESPONSES (%d status reads)" % (target, reads))
+    displayed_responses = 0
+    for entry in RESPONSE_HISTORY:
+        first_ms, last_ms, entry_target, address, status, response_reads = entry
+        if entry_target != target:
+            continue
+        displayed_responses += 1
+        print("  %02d. %7.3f-%7.3f s | 0x%02X | status 0x%02X | %s" %
+              (displayed_responses, first_ms / 1000, last_ms / 1000,
+               address, status, _deployment_state(status)))
+        print("      TC1 pair: %-12s | TC2 pair: %-12s | reads: %d" %
+              ("DEPLOYED" if status & 0x03 == 0 else "NOT DEPLOYED",
+               "DEPLOYED" if status & 0x0c == 0 else "NOT DEPLOYED",
+               response_reads))
+    if displayed_responses == 0:
+        print("  No status byte was returned to the OBC")
+
+    # Report the last byte actually served for this target. Calling assemble()
+    # here could report state which the OBC never observed.
+    target_result = None
+    for key, response in LAST_RESPONSE_BY_TARGET.items():
+        entry_target, address = key
+        status, _, response_ms = response
+        if entry_target == target:
+            if target_result is None or response_ms >= target_result[0]:
+                target_result = (response_ms, address, status)
+    print("-" * 64)
+    print(" FINAL %s RESULT" % target)
+    if target_result is None:
+        print("  No status register response was read by the OBC")
+        return
+    response_ms, address, status = target_result
+    print("  Address    : 0x%02X" % address)
+    print("  Last read  : %.3f s" % (response_ms / 1000))
+    print("  Status     : 0x%02X" % status)
+    print("  Deployment : %s" % _deployment_state(status))
+    print("  TC1 pair   : %s" %
+          ("DEPLOYED" if status & 0x03 == 0 else "NOT DEPLOYED"))
+    print("  TC2 pair   : %s" %
+          ("DEPLOYED" if status & 0x0c == 0 else "NOT DEPLOYED"))
+
+
+def print_test_report(now_ms, start_ms, session):
+    """Print completed-session logs for one board, or both in shared mode."""
+    elapsed_s = time.ticks_diff(now_ms, start_ms) / 1000
+    scenario_name = session["name"]
+    scenario = session["scenario"]
+    board_profile = session["board_profile"]
+    shared_mode = scenario["mode"] == "SHARED_I2C_DEPLOYMENT"
+    targets = ("UHF", "AIS") if shared_mode else (board_profile,)
+
+    print("")
+    print("=" * 64)
+    print(" ANTENNA DEPLOYMENT TEST REPORT")
+    print("=" * 64)
+    print(" Test       : %s" % scenario_name)
+    print(" Mode       : %s" % scenario["mode"])
+    print(" Board      : %s" % ("UHF + AIS" if shared_mode else board_profile))
+    print(" Addresses  : %s" % scenario["address_set"])
+    print(" Elapsed    : %.3f s" % elapsed_s)
+
+    for target in targets:
+        writes = PRIMARY_WRITES if target == "UHF" else SECONDARY_WRITES
+        reads = PRIMARY_READS if target == "UHF" else SECONDARY_READS
+        _print_target_report(target, writes, reads)
+
     if COMMAND_HISTORY_DROPPED:
         print("  Note: %d command(s) exceeded the history limit" %
               COMMAND_HISTORY_DROPPED)
-
-    print("-" * 64)
-    print(" PICO RESPONSES (%d status reads by %s)" %
-          (profile_reads, board_profile))
-    displayed_responses = 0
-    for entry in RESPONSE_HISTORY:
-        first_ms, last_ms, target, address, status, reads = entry
-        if target != board_profile:
-            continue
-        displayed_responses += 1
-        feedback = status & 0x0f
-        if feedback == 0x0f:
-            state = "ALL STORED"
-        elif feedback == 0x0c:
-            state = "TC1 PAIR DEPLOYED"
-        elif feedback == 0x03:
-            state = "TC2 PAIR DEPLOYED"
-        elif feedback == 0x00:
-            state = "ALL DEPLOYED"
-        else:
-            state = "MIXED FEEDBACK"
-        print("  %02d. %7.3f-%7.3f s | 0x%02X | status 0x%02X | %s" %
-              (displayed_responses, first_ms / 1000, last_ms / 1000,
-               address, status, state))
-        print("      TC1 pair: %-12s | TC2 pair: %-12s | reads: %d" %
-              ("DEPLOYED" if status & 0x03 == 0 else "NOT DEPLOYED",
-               "DEPLOYED" if status & 0x0c == 0 else "NOT DEPLOYED", reads))
-    if displayed_responses == 0:
-        print("  No status byte was returned to the OBC")
     if RESPONSE_HISTORY_DROPPED:
         print("  Note: %d response transition(s) exceeded the history limit" %
               RESPONSE_HISTORY_DROPPED)
-
-    # BOARD_PROFILE selects the board whose last actually-served register byte
-    # is promoted as the test result. Do not call assemble() here: that could
-    # report a state which the OBC never read.
-    profile_result = None
-    for key, response in LAST_RESPONSE_BY_TARGET.items():
-        target, address = key
-        status, _, response_ms = response
-        if target == board_profile:
-            if profile_result is None or response_ms >= profile_result[0]:
-                profile_result = (response_ms, address, status)
-    if profile_result is None:
-        print("-" * 64)
-        print(" FINAL %s RESULT" % board_profile)
-        print("  No status register response was read by the OBC")
-    else:
-        response_ms, address, status = profile_result
-        feedback = status & 0x0f
-        if feedback == 0x0f:
-            state = "ALL STORED"
-        elif feedback == 0x0c:
-            state = "TC1 PAIR DEPLOYED"
-        elif feedback == 0x03:
-            state = "TC2 PAIR DEPLOYED"
-        elif feedback == 0x00:
-            state = "ALL DEPLOYED"
-        else:
-            state = "MIXED FEEDBACK"
-        print("-" * 64)
-        print(" FINAL %s RESULT" % board_profile)
-        print("  Address    : 0x%02X" % address)
-        print("  Last read  : %.3f s" % (response_ms / 1000))
-        print("  Status     : 0x%02X" % status)
-        print("  Deployment : %s" % state)
-        print("  TC1 pair   : %s" %
-              ("DEPLOYED" if status & 0x03 == 0 else "NOT DEPLOYED"))
-        print("  TC2 pair   : %s" %
-              ("DEPLOYED" if status & 0x0c == 0 else "NOT DEPLOYED"))
     print("=" * 64)
     print(" END OF REPORT")
     print("=" * 64)
-
 
 def validate_i2c_target_config(name, i2c_id, address, sda, scl):
     if i2c_id not in (0, 1):
