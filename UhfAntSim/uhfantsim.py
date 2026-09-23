@@ -80,11 +80,16 @@ SECONDARY_SCL    = 27        # GP27 (I2C1 SCL pins: 3,7,11,15,19,27)
 # and, after serving the final UHF deployed status, re-addresses the same
 # hardware block as AIS main (0x47). The harness must put both OBC transactions
 # on this physical bus; software cannot bridge two electrically separate buses.
+#
+# shared_i2c_deployment_redundant is the same handoff, but both boards answer
+# on their redundant addresses instead (UHF 0x46, then AIS 0x48).
 SHARED_I2C_ID = 0
 SHARED_SDA = 20
 SHARED_SCL = 21
 SHARED_UHF_ADDRESS = PRIMARY_MAIN_ADDRESS
 SHARED_AIS_ADDRESS = SECONDARY_MAIN_ADDRESS
+SHARED_UHF_REDUNDANT_ADDRESS = PRIMARY_REDUNDANT_ADDRESS
+SHARED_AIS_REDUNDANT_ADDRESS = SECONDARY_REDUNDANT_ADDRESS
 SHARED_HANDOFF_DELAY_MS = 20
 
 # Shared mode keeps both boards stored on power alone. UHF therefore proceeds
@@ -328,6 +333,15 @@ SCENARIOS = {
         "tc2_delay_s": TC2_DEPLOY_DELAY_S,
         "address_set": "shared",
     },
+    # Same UHF->AIS handoff as shared_i2c_deployment, but both boards answer
+    # on their redundant addresses (UHF 0x46, then AIS 0x48) instead of main.
+    "shared_i2c_deployment_redundant": {
+        "mode": "SHARED_I2C_DEPLOYMENT",
+        "uhf_power_delay_s": 5,
+        "tc1_delay_s": TC1_DEPLOY_DELAY_S,
+        "tc2_delay_s": TC2_DEPLOY_DELAY_S,
+        "address_set": "shared_redundant",
+    },
 }
 
 # Short USB command names mapped to the existing descriptive scenarios.
@@ -349,11 +363,13 @@ TEST_COMMAND_LOOKUP = {
     "test15": "test15_redundant_ignore_all",
     "test16": "redundant_deploy",
     "test17": "shared_i2c_deployment",
+    "test18": "shared_i2c_deployment_redundant",
 }
 
 # AIS-only aliases use the same scenario mechanics, but select the AIS target
 # and its redundant address set.  AIS scenarios intentionally exclude the
-# shared-bus test (ais17); that behavior is covered by test17.
+# shared-bus tests (ais17, ais18); both boards are already exercised together
+# by test17/test18.
 for _index in range(1, 17):
     TEST_COMMAND_LOOKUP["ais%02d" % _index] = TEST_COMMAND_LOOKUP["test%02d" % _index]
 
@@ -1018,6 +1034,8 @@ def scenario_i2c_addresses(scenario, board_profile=BOARD_PROFILE):
                 (PRIMARY_REDUNDANT_ADDRESS, SECONDARY_REDUNDANT_ADDRESS))
     if address_set == "shared":
         return SHARED_UHF_ADDRESS, SHARED_AIS_ADDRESS
+    if address_set == "shared_redundant":
+        return SHARED_UHF_REDUNDANT_ADDRESS, SHARED_AIS_REDUNDANT_ADDRESS
     raise ValueError("Unsupported address_set: %r" % address_set)
 
 
@@ -1069,8 +1087,9 @@ def validate_session(session):
 
     if mode == "SHARED_I2C_DEPLOYMENT":
         _nonnegative_number(scenario.get("uhf_power_delay_s"), "uhf_power_delay_s")
-        validate_i2c_target_config("SHARED", SHARED_I2C_ID, SHARED_UHF_ADDRESS, SHARED_SDA, SHARED_SCL)
-        validate_i2c_target_config("SHARED", SHARED_I2C_ID, SHARED_AIS_ADDRESS, SHARED_SDA, SHARED_SCL)
+        shared_uhf_address, shared_ais_address = scenario_i2c_addresses(scenario, board_profile)
+        validate_i2c_target_config("SHARED", SHARED_I2C_ID, shared_uhf_address, SHARED_SDA, SHARED_SCL)
+        validate_i2c_target_config("SHARED", SHARED_I2C_ID, shared_ais_address, SHARED_SDA, SHARED_SCL)
         if DI_PIN in (SHARED_SDA, SHARED_SCL):
             raise ValueError("DI_PIN must not collide with shared I2C GPIOs")
         _nonnegative_number(SHARED_HANDOFF_DELAY_MS, "SHARED_HANDOFF_DELAY_MS")
@@ -1184,6 +1203,10 @@ def run_normal_session(session, slaves, di):
     global PRIMARY_WRITES, PRIMARY_READS, SECONDARY_WRITES, SECONDARY_READS
     primary_sim = DeploymentSim(session["scenario"])
     secondary_sim = DeploymentSim(session["scenario"])
+    # slaves[0] represents the AIS board (not "UHF") whenever this session's
+    # board_profile is AIS, since configure_session_hardware() puts the sole
+    # AIS-address slave there for AIS-only sessions (bench exposes only I2C0).
+    primary_target = "AIS" if session["board_profile"] == "AIS" else "UHF"
     start_ms = time.ticks_ms()
     duration_ms = session["duration_s"] * 1000
     last_count_report = start_ms
@@ -1191,14 +1214,20 @@ def run_normal_session(session, slaves, di):
         now = time.ticks_ms()
         power_on = _read_power(di)
         for cmd in slaves[0].read_pending():
-            PRIMARY_WRITES += 1
-            record_obc_command(now, start_ms, "UHF", slaves[0].address, cmd)
+            if primary_target == "UHF":
+                PRIMARY_WRITES += 1
+            else:
+                SECONDARY_WRITES += 1
+            record_obc_command(now, start_ms, primary_target, slaves[0].address, cmd)
             primary_sim.apply_command(cmd)
         if slaves[0].read_requested():
             reg = primary_sim.assemble()
             slaves[0].send_byte(reg)
-            PRIMARY_READS += 1
-            _record_response(now, start_ms, "UHF", slaves[0], reg)
+            if primary_target == "UHF":
+                PRIMARY_READS += 1
+            else:
+                SECONDARY_READS += 1
+            _record_response(now, start_ms, primary_target, slaves[0], reg)
         if len(slaves) > 1:
             for cmd in slaves[1].read_pending():
                 SECONDARY_WRITES += 1
@@ -1223,6 +1252,7 @@ def run_normal_session(session, slaves, di):
 def run_shared_i2c_deployment(session, slave, di):
     global PRIMARY_WRITES, PRIMARY_READS, SECONDARY_WRITES, SECONDARY_READS
     scenario = session["scenario"]
+    uhf_address, ais_address = scenario_i2c_addresses(scenario, session["board_profile"])
     uhf_sim = DeploymentSim(scenario)
     ais_sim = DeploymentSim(scenario)
     active_target, active_sim = "UHF", uhf_sim
@@ -1239,7 +1269,7 @@ def run_shared_i2c_deployment(session, slave, di):
             if cmd == SIM_RESET_COMMAND:
                 uhf_sim.reset(); ais_sim.reset()
                 active_target, active_sim, handoff_at = "UHF", uhf_sim, None
-                slave.set_address(SHARED_UHF_ADDRESS)
+                slave.set_address(uhf_address)
             else:
                 active_sim.apply_command(cmd)
         if slave.read_requested():
@@ -1257,7 +1287,7 @@ def run_shared_i2c_deployment(session, slave, di):
         else:
             ais_sim.update_sequential(power_on, now, scenario)
         if active_target == "UHF" and handoff_at is not None and time.ticks_diff(now, handoff_at) >= 0:
-            slave.set_address(SHARED_AIS_ADDRESS)
+            slave.set_address(ais_address)
             active_target, active_sim, handoff_at = "AIS", ais_sim, None
         time.sleep_ms(POLL_MS)
     return start_ms, time.ticks_ms()
