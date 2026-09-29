@@ -45,7 +45,9 @@
 #  Mauricio Matamoros). Verified against the RP2040 datasheet register map.
 # =============================================================================
 
+import gc
 import machine
+import select
 import time
 import sys
 
@@ -115,10 +117,22 @@ DI_PULL           = "down"     # "down" | "up" | None  (internal pull on DI pin)
 #   at startup so an AIS board can't be power-deployed by mistake.
 BOARD_PROFILE = "UHF"        # "UHF" | "AIS"
 
-# Configure one finite test session over USB CDC before enabling I2C.
+# Configure one test session over USB CDC before enabling I2C.
 USB_SCENARIO_CONTROL = True
-DEFAULT_SESSION_DURATION_S = 200
+DEFAULT_SESSION_DURATION_S = 400
+# A test command may carry its own duration: "test01 500" runs 500 s and
+# "test01 none" runs until a runtime "end"/"abort". Numeric durations are
+# capped so ticks_diff() (valid for ~6.2 days of ms ticks) stays correct.
+MAX_SESSION_DURATION_S = 500000
 USB_COMMAND_MAX_BYTES = 256
+
+# Runtime USB commands accepted while a session is running (status, end,
+# abort, testNN/aisNN). stdin is polled without blocking, one character
+# per service-loop pass. A completed line is executed right after the next
+# served I2C read (the OBC reads ~1/s, so the bus is then idle), or after
+# RUNTIME_COMMAND_DEFER_MS if no read arrives.
+RUNTIME_COMMANDS = True
+RUNTIME_COMMAND_DEFER_MS = 1200
 
 # Does a thermal cutter need ANT_POWER present to fire? A real burn-wire does,
 # so deployment is gated on power by default. Set False only if your test bench
@@ -389,8 +403,9 @@ POLL_MS      = 0         # 0 = busy-loop; minimizes I2C clock-stretch latency
 # --- USB serial test report ------------------------------------------------
 # MicroPython print() output is carried by the Pico micro-USB CDC/REPL serial
 # connection. Keep command history bounded so a noisy or long run cannot
-# consume unbounded Pico RAM. The report is emitted once, 200 seconds after
-# the simulator starts servicing the bus.
+# consume unbounded Pico RAM. The report is emitted once, after the session
+# ends (duration expiry, runtime "end", or a runtime testNN switch) and I2C is
+# disabled. REPORT_AFTER_S is not used by the code.
 # Master switch for command/response collection and the timed USB report.
 # Set REPORT = False to disable the complete reporting feature.
 REPORT = True
@@ -953,6 +968,7 @@ def print_test_report(now_ms, start_ms, session):
     print(" Mode       : %s" % scenario["mode"])
     print(" Board      : %s" % ("UHF + AIS" if shared_mode else board_profile))
     print(" Addresses  : %s" % scenario["address_set"])
+    print(" Duration   : %s" % _duration_text(session))
     print(" Elapsed    : %.3f s" % elapsed_s)
 
     for target in targets:
@@ -986,22 +1002,40 @@ def validate_i2c_target_config(name, i2c_id, address, sda, scl):
 def wait_for_usb_configuration():
     print("")
     print("CONFIG_READY")
-    line = sys.stdin.readline()
-    if line is None:
-        raise ValueError("No USB command received")
-    command = line.strip().lower()
-    if not command:
-        raise ValueError("Empty USB command")
+    # Skip blank lines: a runtime "end\r\n" is completed at "\r", leaving
+    # its "\n" queued for this read.
+    command = ""
+    while not command:
+        line = sys.stdin.readline()
+        if not line:
+            raise ValueError("No USB command received")
+        command = line.strip().lower()
     if len(command) > USB_COMMAND_MAX_BYTES:
         raise ValueError("USB command is too long")
-    scenario_name = TEST_COMMAND_LOOKUP.get(command)
+    return make_test_request(command)
+
+
+def make_test_request(command):
+    """Parse "testNN [seconds|none]" into a session request."""
+    parts = command.split()
+    if not parts or len(parts) > 2:
+        raise ValueError("Expected: testNN [seconds|none]")
+    test_id = parts[0]
+    scenario_name = TEST_COMMAND_LOOKUP.get(test_id)
     if scenario_name is None:
-        raise ValueError("Unknown test command: %s" % command)
-    return {
-        "command_id": command,
+        raise ValueError("Unknown test command: %s" % test_id)
+    request = {
+        "command_id": test_id,
         "scenario": scenario_name,
-        "board_profile": "AIS" if command.startswith("ais") else "UHF",
+        "board_profile": "AIS" if test_id.startswith("ais") else "UHF",
     }
+    if len(parts) == 2:
+        if parts[1] == "none":
+            request["duration_s"] = None
+        else:
+            # int() raises ValueError for non-numeric text such as "5s".
+            request["duration_s"] = int(parts[1])
+    return request
 
 
 def build_session(request):
@@ -1051,8 +1085,11 @@ def validate_session(session):
     duration_s = session["duration_s"]
     if board_profile not in ("UHF", "AIS"):
         raise ValueError("board_profile must be UHF or AIS")
-    if isinstance(duration_s, bool) or not isinstance(duration_s, (int, float)) or duration_s <= 0:
-        raise ValueError("duration_s must be greater than zero")
+    if duration_s is not None and (
+            isinstance(duration_s, bool) or
+            not isinstance(duration_s, (int, float)) or
+            not (0 < duration_s <= MAX_SESSION_DURATION_S)):
+        raise ValueError("duration_s must be 1..%d or None" % MAX_SESSION_DURATION_S)
     if DRIVER != "register":
         raise ValueError("Only DRIVER='register' is supported")
     if POLL_MS < 0 or REPORT_COMMAND_LIMIT < 0 or REPORT_RESPONSE_LIMIT < 0:
@@ -1199,7 +1236,123 @@ def _record_response(now, start_ms, target, slave, reg):
         LAST_RESPONSE_BY_TARGET[key] = (reg, None, response_ms)
 
 
-def run_normal_session(session, slaves, di):
+class RuntimeConsole:
+    """Non-blocking USB line reader for commands issued during a session."""
+
+    def __init__(self):
+        self._poll = select.poll()
+        self._poll.register(sys.stdin, select.POLLIN)
+        self._buf = ""
+        self._overflow = False
+        self._pending = None
+        self._pending_ms = 0
+
+    def _stdin_ready(self):
+        # ipoll() reuses its result object; poll() would allocate a list on
+        # every loop pass and bring on more frequent GC pauses.
+        for _ in self._poll.ipoll(0):
+            return True
+        return False
+
+    def finish(self):
+        """Call once I2C is disabled: name a command that was still waiting,
+        or only partly received, when the session ended."""
+        if self._pending is not None:
+            print("RT_DROPPED=%s" % self._pending)
+            self._pending = None
+        if self._buf or self._overflow:
+            # A line cut off by the session end: consume the rest of it so it
+            # is not misread as a test command at CONFIG_READY.
+            while self._stdin_ready():
+                ch = sys.stdin.read(1)
+                if ch == "\r" or ch == "\n":
+                    break
+                if len(self._buf) < USB_COMMAND_MAX_BYTES:
+                    self._buf += ch
+            print("RT_DROPPED=%s" % self._buf.strip().lower())
+            self._buf, self._overflow = "", False
+
+    def service(self, now, read_served):
+        """Return a completed command once it is safe to run, else None.
+
+        Reads at most one character per call so a long line never adds more
+        than one character's worth of latency to a single loop pass.
+        """
+        if self._pending is None and self._stdin_ready():
+            ch = sys.stdin.read(1)
+            if ch == "\r" or ch == "\n":
+                line = self._buf.strip().lower()
+                overflow = self._overflow
+                self._buf, self._overflow = "", False
+                if overflow:
+                    print("RT_NACK=TOO_LONG")
+                elif line:
+                    self._pending, self._pending_ms = line, now
+            elif len(self._buf) < USB_COMMAND_MAX_BYTES:
+                self._buf += ch
+            else:
+                self._overflow = True
+        if self._pending is not None and (
+                read_served or
+                time.ticks_diff(now, self._pending_ms) >= RUNTIME_COMMAND_DEFER_MS):
+            line, self._pending = self._pending, None
+            return line
+        return None
+
+
+def _print_runtime_status(session, start_ms, now, power_on, targets, loop_max_us):
+    """One-line snapshot; targets is a list of (name, address, sim, active)."""
+    parts = ["RT_STATUS t=%.3fs duration=%s test=%s power=%d loop_max_us=%d" %
+             (time.ticks_diff(now, start_ms) / 1000, _duration_text(session),
+              session["command_id"], power_on, loop_max_us)]
+    for name, address, sim, active in targets:
+        reads = PRIMARY_READS if name == "UHF" else SECONDARY_READS
+        writes = PRIMARY_WRITES if name == "UHF" else SECONDARY_WRITES
+        parts.append("%s%s 0x%02X reg=0x%02X phase=%d deployed=%d r=%d w=%d" %
+                     (name, "*" if active else "", address, sim.assemble(),
+                      sim.sequence_phase, sim.deployed, reads, writes))
+    print(" | ".join(parts))
+
+
+def handle_runtime_command(line, session, start_ms, now, power_on, targets,
+                           loop_max_us):
+    """Run one runtime command.
+
+    Returns None to keep going; "end" or "abort" for the loop to act on; or
+    a validated session to switch to once the current one ends.
+    """
+    if line == "status":
+        _print_runtime_status(session, start_ms, now, power_on, targets,
+                              loop_max_us)
+    elif line in ("end", "abort"):
+        print("RT_ACK=%s" % line)
+        return line
+    elif line.split()[0] in TEST_COMMAND_LOOKUP:
+        try:
+            next_session = build_session(make_test_request(line))
+            validate_session(next_session)
+        except (ValueError, TypeError, KeyError):
+            print("RT_NACK=%s" % line)
+            return None
+        print("RT_ACK=%s" % line)
+        return next_session
+    else:
+        print("RT_NACK=%s" % line)
+    return None
+
+
+def _session_duration_ms(session):
+    """Session length in ms, or None to run until end/abort."""
+    duration_s = session["duration_s"]
+    return None if duration_s is None else duration_s * 1000
+
+
+def _duration_text(session):
+    duration_s = session["duration_s"]
+    return "none" if duration_s is None else "%ds" % duration_s
+
+
+def run_normal_session(session, slaves, di, console):
     global PRIMARY_WRITES, PRIMARY_READS, SECONDARY_WRITES, SECONDARY_READS
     primary_sim = DeploymentSim(session["scenario"])
     secondary_sim = DeploymentSim(session["scenario"])
@@ -1207,12 +1360,17 @@ def run_normal_session(session, slaves, di):
     # board_profile is AIS, since configure_session_hardware() puts the sole
     # AIS-address slave there for AIS-only sessions (bench exposes only I2C0).
     primary_target = "AIS" if session["board_profile"] == "AIS" else "UHF"
+    outcome = None          # None, "abort", or the session to switch to
+    loop_max_us = 0
     start_ms = time.ticks_ms()
-    duration_ms = session["duration_s"] * 1000
+    duration_ms = _session_duration_ms(session)
     last_count_report = start_ms
-    while time.ticks_diff(time.ticks_ms(), start_ms) < duration_ms:
+    while (duration_ms is None or
+           time.ticks_diff(time.ticks_ms(), start_ms) < duration_ms):
+        pass_start_us = time.ticks_us()
         now = time.ticks_ms()
         power_on = _read_power(di)
+        read_served = False
         for cmd in slaves[0].read_pending():
             if primary_target == "UHF":
                 PRIMARY_WRITES += 1
@@ -1223,6 +1381,7 @@ def run_normal_session(session, slaves, di):
         if slaves[0].read_requested():
             reg = primary_sim.assemble()
             slaves[0].send_byte(reg)
+            read_served = True
             if primary_target == "UHF":
                 PRIMARY_READS += 1
             else:
@@ -1236,20 +1395,35 @@ def run_normal_session(session, slaves, di):
             if slaves[1].read_requested():
                 reg = secondary_sim.assemble()
                 slaves[1].send_byte(reg)
+                read_served = True
                 SECONDARY_READS += 1
                 _record_response(now, start_ms, "AIS", slaves[1], reg)
         primary_sim.update(power_on, now)
         if len(slaves) > 1:
             secondary_sim.update(power_on, now)
+        if console is not None:
+            line = console.service(now, read_served)
+            if line is not None:
+                targets = [(primary_target, slaves[0].address, primary_sim, True)]
+                if len(slaves) > 1:
+                    targets.append(("AIS", slaves[1].address, secondary_sim, True))
+                action = handle_runtime_command(
+                    line, session, start_ms, now, power_on, targets, loop_max_us)
+                if action == "end":
+                    break
+                elif action is not None:
+                    outcome = action
+                    break
         if DEBUG_COUNTS and time.ticks_diff(now, last_count_report) >= 7000:
             print("[I2C_COUNTS] primary r=%d w=%d | secondary r=%d w=%d" %
                   (PRIMARY_READS, PRIMARY_WRITES, SECONDARY_READS, SECONDARY_WRITES))
             last_count_report = now
+        loop_max_us = max(loop_max_us, time.ticks_diff(time.ticks_us(), pass_start_us))
         time.sleep_ms(POLL_MS)
-    return start_ms, time.ticks_ms()
+    return start_ms, time.ticks_ms(), outcome
 
 
-def run_shared_i2c_deployment(session, slave, di):
+def run_shared_i2c_deployment(session, slave, di, console):
     global PRIMARY_WRITES, PRIMARY_READS, SECONDARY_WRITES, SECONDARY_READS
     scenario = session["scenario"]
     uhf_address, ais_address = scenario_i2c_addresses(scenario, session["board_profile"])
@@ -1257,11 +1431,16 @@ def run_shared_i2c_deployment(session, slave, di):
     ais_sim = DeploymentSim(scenario)
     active_target, active_sim = "UHF", uhf_sim
     handoff_at = None
+    outcome = None          # None, "abort", or the session to switch to
+    loop_max_us = 0
     start_ms = time.ticks_ms()
-    duration_ms = session["duration_s"] * 1000
-    while time.ticks_diff(time.ticks_ms(), start_ms) < duration_ms:
+    duration_ms = _session_duration_ms(session)
+    while (duration_ms is None or
+           time.ticks_diff(time.ticks_ms(), start_ms) < duration_ms):
+        pass_start_us = time.ticks_us()
         now = time.ticks_ms()
         power_on = _read_power(di)
+        read_served = False
         for cmd in slave.read_pending():
             record_obc_command(now, start_ms, active_target, slave.address, cmd)
             if active_target == "UHF": PRIMARY_WRITES += 1
@@ -1275,6 +1454,7 @@ def run_shared_i2c_deployment(session, slave, di):
         if slave.read_requested():
             reg = active_sim.assemble()
             slave.send_byte(reg)
+            read_served = True
             _record_response(now, start_ms, active_target, slave, reg)
             if active_target == "UHF":
                 PRIMARY_READS += 1
@@ -1282,6 +1462,18 @@ def run_shared_i2c_deployment(session, slave, di):
                     handoff_at = time.ticks_add(now, SHARED_HANDOFF_DELAY_MS)
             else:
                 SECONDARY_READS += 1
+        if console is not None:
+            line = console.service(now, read_served)
+            if line is not None:
+                targets = [("UHF", uhf_address, uhf_sim, active_target == "UHF"),
+                           ("AIS", ais_address, ais_sim, active_target == "AIS")]
+                action = handle_runtime_command(
+                    line, session, start_ms, now, power_on, targets, loop_max_us)
+                if action == "end":
+                    break
+                elif action is not None:
+                    outcome = action
+                    break
         if active_target == "UHF":
             uhf_sim.update_shared_uhf(power_on, now, scenario)
         else:
@@ -1289,8 +1481,9 @@ def run_shared_i2c_deployment(session, slave, di):
         if active_target == "UHF" and handoff_at is not None and time.ticks_diff(now, handoff_at) >= 0:
             slave.set_address(ais_address)
             active_target, active_sim, handoff_at = "AIS", ais_sim, None
+        loop_max_us = max(loop_max_us, time.ticks_diff(time.ticks_us(), pass_start_us))
         time.sleep_ms(POLL_MS)
-    return start_ms, time.ticks_ms()
+    return start_ms, time.ticks_ms(), outcome
 
 
 def _disable_slaves(slaves):
@@ -1299,40 +1492,55 @@ def _disable_slaves(slaves):
 
 
 def run_session(session):
+    """Run one session; return the next session if one was requested at runtime."""
     reset_session_report()
+    # Collect the previous session's garbage now rather than mid-session.
+    gc.collect()
     slaves = []
     try:
         slaves, di = configure_session_hardware(session)
+        console = RuntimeConsole() if RUNTIME_COMMANDS else None
         print_session_ack(session)
         if session["scenario"]["mode"] == "SHARED_I2C_DEPLOYMENT":
-            start_ms, end_ms = run_shared_i2c_deployment(session, slaves[0], di)
+            start_ms, end_ms, outcome = run_shared_i2c_deployment(
+                session, slaves[0], di, console)
         else:
-            start_ms, end_ms = run_normal_session(session, slaves, di)
+            start_ms, end_ms, outcome = run_normal_session(
+                session, slaves, di, console)
         _disable_slaves(slaves)
         slaves = []
+        if console is not None:
+            console.finish()
+        if outcome == "abort":
+            print("SESSION_ABORTED")
+            return None
         if REPORT:
             print_test_report(end_ms, start_ms, session)
         print("SESSION_COMPLETE")
+        return outcome
     finally:
         _disable_slaves(slaves)
 
 
 def main():
     disable_all_i2c_blocks()
+    next_session = None
     while True:
+        session, next_session = next_session, None
+        if session is None:
+            try:
+                request = (wait_for_usb_configuration()
+                           if USB_SCENARIO_CONTROL else {
+                               "command_id": "configured",
+                               "scenario": ACTIVE_SCENARIO,
+                           })
+                session = build_session(request)
+                validate_session(session)
+            except (ValueError, TypeError, KeyError):
+                print("NACK=INVALID")
+                continue
         try:
-            request = (wait_for_usb_configuration()
-                       if USB_SCENARIO_CONTROL else {
-                           "command_id": "configured",
-                           "scenario": ACTIVE_SCENARIO,
-                       })
-            session = build_session(request)
-            validate_session(session)
-        except (ValueError, TypeError, KeyError):
-            print("NACK=INVALID")
-            continue
-        try:
-            run_session(session)
+            next_session = run_session(session)
         except Exception as error:
             print("RUNTIME_ERROR reason=%s" % error)
 

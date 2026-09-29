@@ -6,8 +6,9 @@ antenna deployment boards.
 
 A test is selected over the Pico micro-USB connection with one short ASCII
 command such as `test01` or `test12`. The Pico configures the complete session,
-acknowledges it, runs I2C without polling USB, disables I2C when the session
-expires, prints the optional report, and waits for the next command.
+acknowledges it, runs I2C while accepting optional runtime commands over USB,
+disables I2C when the session expires or is ended, prints the optional
+report, and waits for the next command.
 
 ## Hardware interfaces
 
@@ -37,23 +38,38 @@ Send one case-insensitive ASCII test command followed by a newline:
 test12\n
 ```
 
+An optional second word sets the session length in seconds; `none` runs until
+a runtime `end` or `abort`. Without it the session lasts
+`DEFAULT_SESSION_DURATION_S` (400 s):
+
+| Command | Session length |
+|---|---|
+| `test12` | 400 s (default) |
+| `test12 500` | 500 s |
+| `test12 none` | Until `end` or `abort` |
+
+The duration must be a whole number from 1 to `MAX_SESSION_DURATION_S`
+(500000 s, about 5.8 days, the range MicroPython's millisecond tick arithmetic
+handles correctly). A `none` session keeps serving I2C indefinitely, but
+elapsed times in `status` and the report wrap after about 6.2 days.
+
 After validating the command and configuring the associated I2C address or
-addresses, the Pico prints:
+addresses, the Pico prints the ACK with the test ID only (no duration):
 
 ```text
 ACK=test12
 ```
 
 The laptop may start the OBC/HIL test only after receiving the ACK. During the
-active session the Pico does not read USB input. At the end it disables I2C,
-prints the report when `REPORT = True`, then prints:
+active session the Pico accepts the runtime commands described below. At the
+end it disables I2C, prints the report when `REPORT = True`, then prints:
 
 ```text
 SESSION_COMPLETE
 CONFIG_READY
 ```
 
-Invalid, empty, or oversized commands produce:
+Blank lines are ignored. Invalid or oversized commands produce:
 
 ```text
 NACK=INVALID
@@ -74,6 +90,33 @@ while True:
         raise RuntimeError("Pico rejected the test command")
 ```
 
+### Runtime commands
+
+While a session is running (`RUNTIME_COMMANDS = True`), send one of these
+newline-terminated, case-insensitive commands:
+
+| Command | Effect | Reply |
+|---|---|---|
+| `status` | One-line snapshot: elapsed time, session duration, power input, worst loop pass, and per target the address, register, sequence phase, deployed flag, and read/write counts (`*` marks the active target) | `RT_STATUS ...` |
+| `end` | Ends the session now: I2C disabled, report, `SESSION_COMPLETE`, `CONFIG_READY` | `RT_ACK=end` |
+| `abort` | Ends the session now without a report: I2C disabled, `SESSION_ABORTED`, `CONFIG_READY` | `RT_ACK=abort` |
+| `testNN [seconds\|none]` / `aisNN [seconds\|none]` | Ends the current session like `end`, then starts the new test directly with `ACK=testNN` and no `CONFIG_READY` in between; the duration works as it does at `CONFIG_READY` | `RT_ACK=testNN ...` |
+
+Unknown or invalid commands reply `RT_NACK=<command>` and the session keeps
+running. A command still waiting to run, or only partly received, when the
+session duration expires is not executed; the Pico prints
+`RT_DROPPED=<command>` after disabling I2C and before the report. Runtime
+replies all start with `RT_`, so a host that waits for `ACK=`/`SESSION_COMPLETE`
+is not affected.
+
+USB input never blocks I2C servicing. stdin is polled without waiting, one
+character per loop pass. A completed command runs right after the next status
+read the Pico serves (the OBC reads about once per second, so the bus is then
+idle), or after `RUNTIME_COMMAND_DEFER_MS` (1.2 s) if no read arrives. The
+full report is only printed after I2C is disabled (`end`, `testNN`, or the
+duration expiring). Check `loop_max_us` in `status` against the OBC's I2C
+timeout.
+
 The serial baud setting is nominal for USB CDC, but the laptop should use a
 consistent configuration and ensure no IDE or serial monitor already owns the
 port.
@@ -84,7 +127,7 @@ These source settings apply to every short command:
 
 ```python
 BOARD_PROFILE = "UHF"                 # "UHF" or "AIS"
-DEFAULT_SESSION_DURATION_S = 200
+DEFAULT_SESSION_DURATION_S = 400     # overridden by "testNN <s|none>"
 DUAL_ADDRESS = True
 TC_REQUIRES_POWER = True
 
@@ -102,7 +145,8 @@ Important behavior:
 
 - `BOARD_PROFILE` selects the board shown in the report and prevents AIS from
   using a power-on deployment scenario.
-- `DEFAULT_SESSION_DURATION_S` ends the session even when `REPORT = False`.
+- The session duration (default, per-command, or `none`) applies even when
+  `REPORT = False`.
 - `DUAL_ADDRESS = True` normally creates independent UHF and AIS targets.
 - `TC_REQUIRES_POWER = True` requires GP15 antenna power before a cutter can
   deploy its pair.
@@ -122,13 +166,16 @@ flowchart TD
     F --> C
     E -- Yes --> G[Reset report state and configure hardware]
     G --> H[Print ACK=testNN]
-    H --> I[Run finite I2C service loop without USB reads]
-    I --> J[Session duration expires]
+    H --> I[Run I2C service loop and poll runtime commands]
+    I --> J[Duration expires, end, or testNN]
+    I -- abort --> Q[Disable I2C targets, print SESSION_ABORTED]
+    Q --> C
     J --> K[Disable I2C targets]
     K --> L{REPORT enabled?}
     L -- Yes --> M[Print report]
     L -- No --> N[Print SESSION_COMPLETE]
     M --> N
+    N -- testNN requested --> G
     N --> C
 ```
 
@@ -188,7 +235,8 @@ the full internal scenario name even though the laptop selects it by short ID.
 | `test14` | `test14_redundant_tc1_ignored_tc2_deploy` | Redundant | TC1 rejected; TC2 deploys Pair 2 |
 | `test15` | `test15_redundant_ignore_all` | Redundant | Both cutter commands rejected |
 | `test16` | `redundant_deploy` | Redundant | Normal sequential behavior on redundant addresses |
-| `test17` | `shared_i2c_deployment` | Shared | UHF and AIS ignore power-only deployment and require TC1 then TC2; I2C0 hands off from `0x45` to `0x47` |
+| `test17` | `shared_i2c_deployment` | Shared (main) | UHF and AIS ignore power-only deployment and require TC1 then TC2; I2C0 hands off from `0x45` to `0x47` |
+| `test18` | `shared_i2c_deployment_redundant` | Shared (redundant) | Same handoff as `test17`, but both boards answer on their redundant addresses; I2C0 hands off from `0x46` to `0x48` |
 
 Main sessions expose UHF `0x45` and AIS `0x47`. Redundant sessions expose UHF
 `0x46` and AIS `0x48`.
@@ -199,8 +247,9 @@ The same simulator also accepts `ais01` through `ais16` for AIS-focused runs.
 These commands reuse the corresponding scenario behavior above, select the AIS
 target in the GDS event stream, and expose only one AIS controller address on
 Pico I²C0 (main `0x47` for `ais01`–`ais09` and redundant `0x48` for
-`ais10`–`ais16`). `ais17` is intentionally not defined because `test17` already
-covers the shared-I²C UHF-to-AIS handoff. The AIS runner defaults the HIL
+`ais10`–`ais16`). `ais17`/`ais18` are intentionally not defined because
+`test17`/`test18` already cover the shared-I²C UHF-to-AIS handoff (main and
+redundant addresses respectively). The AIS runner defaults the HIL
 `obc_di` control pin to GP26; override it with `--test-flight-pin` if the bench
 wiring differs.
 
@@ -225,21 +274,27 @@ also requires TC1 followed by TC2; power alone does not deploy it. The harness
 must route both OBC transactions to this physical bus; the simulator cannot
 bridge separate buses.
 
+`test18` is identical to `test17` except both boards answer on their
+redundant addresses: it begins as UHF at `0x46` and, after the same handoff
+guard interval, switches the same I2C0 block to AIS at `0x48`.
+
 ## Report behavior
 
 When `REPORT = True`, the simulator records bounded command and response
-histories during the session. Once the session duration expires, it first
+histories during the session. Once the session duration expires (or on a
+runtime `end`/`testNN`), it first
 disables every I2C target and then prints the report over USB. The report:
 
 1. Uses the full internal scenario name.
 2. Filters normal-session output using `BOARD_PROFILE`.
 3. Prints separate UHF and AIS command, response, and final-result sections for
-   shared `test17` sessions.
+   shared `test17`/`test18` sessions.
 4. Compresses repeated identical responses and includes their read count.
 5. Uses the last status byte actually returned to each board as its final result.
 
-Set `REPORT = False` to disable collection and printing. The finite session
-still ends after `DEFAULT_SESSION_DURATION_S`.
+Set `REPORT = False` to disable collection and printing. The session still
+ends after its duration. The report header shows both the configured duration
+and the actual elapsed time.
 
 ## Running through the OBC HIL controller
 
@@ -290,4 +345,4 @@ the default images under
   `ACK=testNN` before starting the OBC test.
 - Keep Thonny, VS Code serial monitors, and other processes off the Pico serial
   port while the controller owns it.
-- A full 200-second no-timeout validation requires the Pico and OBC/HIL bench.
+- A full 400-second no-timeout validation requires the Pico and OBC/HIL bench.
