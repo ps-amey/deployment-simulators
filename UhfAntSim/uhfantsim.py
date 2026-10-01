@@ -98,6 +98,16 @@ SHARED_HANDOFF_DELAY_MS = 20
 # through the TC1/TC2 fallback, matching the AIS TC-only sequence after handoff.
 SHARED_UHF_POWER_DEPLOY_SUCCESS = False
 
+# tc2_failover_main_to_red (test20/ais20) uses only Pico I2C0. TC1 is accepted
+# and deploys on the main address. TC2 is then ACKed on main and shown in the
+# register, but never deploys. Once that TC2 write has been received and the
+# bus has been idle for FAILOVER_SWITCH_DELAY_MS, the same hardware block is
+# re-addressed to the redundant address (UHF 0x45 -> 0x46, AIS 0x47 -> 0x48).
+# The OBC polls about once a second, so the switch lands on an idle bus; its
+# status reads then fail on main and fall back to redundant. After the OBC's
+# TC2 timeout it re-sends TC2 to redundant, which deploys ANT3/ANT4.
+FAILOVER_SWITCH_DELAY_MS = 20
+
 INTERNAL_PULLUPS =True
 # Bus data rate is set by the MASTER (target 100 kHz). A slave does not drive
 # the clock, so there is nothing to configure here; just run the master at 100k.
@@ -356,6 +366,15 @@ SCENARIOS = {
         "tc2_delay_s": TC2_DEPLOY_DELAY_S,
         "address_set": "shared_redundant",
     },
+    # TC1 deploys on main. TC2 is ACKed on main but does not deploy; the
+    # target then moves to the redundant address, where the OBC's timed-out
+    # TC2 retry deploys ANT3/ANT4.
+    "tc2_failover_main_to_red": {
+        "mode": "TC2_FAILOVER",
+        "tc1_delay_s": TC1_DEPLOY_DELAY_S,
+        "tc2_delay_s": TC2_DEPLOY_DELAY_S,
+        "address_set": "main_to_red",
+    },
 }
 
 # Short USB command names mapped to the existing descriptive scenarios.
@@ -378,13 +397,14 @@ TEST_COMMAND_LOOKUP = {
     "test16": "redundant_deploy",
     "test17": "shared_i2c_deployment",
     "test18": "shared_i2c_deployment_redundant",
+    "test20": "tc2_failover_main_to_red",
 }
 
 # AIS-only aliases use the same scenario mechanics, but select the AIS target
 # and its redundant address set.  AIS scenarios intentionally exclude the
 # shared-bus tests (ais17, ais18); both boards are already exercised together
-# by test17/test18.
-for _index in range(1, 17):
+# by test17/test18. ais20 runs the TC2 failover on AIS 0x47 -> 0x48.
+for _index in list(range(1, 17)) + [20]:
     TEST_COMMAND_LOOKUP["ais%02d" % _index] = TEST_COMMAND_LOOKUP["test%02d" % _index]
 
 ACTIVE_SCENARIO = "test02_sequential_deploy"
@@ -463,6 +483,7 @@ class PicoI2CSlave:
     # IC_STATUS bits
     _ST_TFNF = 0x02   # Tx FIFO not full
     _ST_RFNE = 0x08   # Rx FIFO not empty
+    _ST_SLV_ACTIVITY = 0x40   # slave FSM not idle (transfer in progress)
     # IC_RAW_INTR_STAT bits
     _IRQ_RD_REQ = 0x20
 
@@ -516,6 +537,10 @@ class PicoI2CSlave:
         self._set(self._IC_SAR, address)
         self.address = address
         self._set(self._IC_ENABLE, 0x0001)
+
+    def is_busy(self):
+        """True while a transfer addressed to this target is in progress."""
+        return bool(self._rd(self._IC_STATUS, self._ST_SLV_ACTIVITY))
 
     def disable(self):
         """Disable this I2C target between test sessions."""
@@ -734,6 +759,10 @@ class DeploymentSim:
             raise ValueError(
                 "SHARED_I2C_DEPLOYMENT must be run by the shared-bus controller")
 
+        if mode == "TC2_FAILOVER":
+            raise ValueError(
+                "TC2_FAILOVER must be run by the failover controller")
+
         raise ValueError("Unsupported scenario mode: %r" % mode)
 
     def update_sequential(self, power_on, now_ms, scen):
@@ -807,6 +836,22 @@ class DeploymentSim:
         # deliberate no-deploy case; they simply do not start a timer.
         self._reset_timer(silent=True)
 
+    def update_tc2_failover(self, power_on, now_ms, scen, tc2_on_redundant):
+        """TC1 deploys as usual; TC2 deploys only once commanded on redundant."""
+        if self.deployed:
+            return
+        if self.sequence_phase == 0:
+            self.update_sequential(power_on, now_ms, scen)
+            return
+        tc_gate = power_on or not TC_REQUIRES_POWER
+        self._update_timed_condition(
+            self.tc2 and tc2_on_redundant and tc_gate,
+            "TC2",
+            scen["tc2_delay_s"],
+            now_ms,
+            self._deploy_second_pair,
+        )
+
     def update_shared_uhf(self, power_on, now_ms, scen):
         """Model UHF power-on success or its TC1/TC2 fallback."""
         if self.deployed:
@@ -851,6 +896,8 @@ COMMAND_HISTORY_DROPPED = 0
 RESPONSE_HISTORY = []
 RESPONSE_HISTORY_DROPPED = 0
 LAST_RESPONSE_BY_TARGET = {}
+# (elapsed_ms, from_address, to_address, reason) for each Pico re-address
+ADDRESS_EVENTS = []
 
 
 def command_name(command):
@@ -951,6 +998,47 @@ def _print_target_report(target, writes, reads):
           ("DEPLOYED" if status & 0x0c == 0 else "NOT DEPLOYED"))
 
 
+def _print_failover_report(target, main_address, red_address):
+    """Summarise the TC2 main -> redundant failover path for test20/ais20."""
+    def first_command(address, bit):
+        for elapsed_ms, entry_target, entry_address, command, _ in COMMAND_HISTORY:
+            if (entry_target == target and entry_address == address and
+                    command != SIM_RESET_COMMAND and command & (1 << bit)):
+                return elapsed_ms
+        return None
+
+    def at(elapsed_ms):
+        return "NOT SEEN" if elapsed_ms is None else "seen at %.3f s" % (elapsed_ms / 1000)
+
+    tc1_main = first_command(main_address, TC1)
+    tc2_main = first_command(main_address, TC2)
+    tc2_red = first_command(red_address, TC2)
+    final = None
+    for (entry_target, _), response in LAST_RESPONSE_BY_TARGET.items():
+        if entry_target == target and (final is None or response[2] >= final[1]):
+            final = (response[0], response[2])
+    all_deployed = final is not None and final[0] & 0x0f == 0
+
+    print("-" * 64)
+    print(" %s ADDRESS FAILOVER (0x%02X -> 0x%02X)" % (target, main_address, red_address))
+    for elapsed_ms, from_address, to_address, reason in ADDRESS_EVENTS:
+        print("  %7.3f s | 0x%02X -> 0x%02X | %s" %
+              (elapsed_ms / 1000, from_address, to_address, reason))
+    if not ADDRESS_EVENTS:
+        print("  No address switch happened")
+    print("  TC1 on main      : %s" % at(tc1_main))
+    print("  TC2 on main      : %s" % at(tc2_main))
+    print("  TC2 on redundant : %s" % at(tc2_red))
+    if tc2_main is not None and tc2_red is not None:
+        print("  TC2 main->red gap: %.3f s (OBC TC2 timeout)" %
+              ((tc2_red - tc2_main) / 1000))
+    passed = (tc1_main is not None and tc2_main is not None and
+              tc2_red is not None and len(ADDRESS_EVENTS) > 0 and all_deployed)
+    print("  Failover result  : %s" % ("PASS" if passed else "INCOMPLETE"))
+    if COMMAND_HISTORY_DROPPED:
+        print("  Warning: command history overflowed; result may be incomplete")
+
+
 def print_test_report(now_ms, start_ms, session):
     """Print completed-session logs for one board, or both in shared mode."""
     elapsed_s = time.ticks_diff(now_ms, start_ms) / 1000
@@ -975,6 +1063,9 @@ def print_test_report(now_ms, start_ms, session):
         writes = PRIMARY_WRITES if target == "UHF" else SECONDARY_WRITES
         reads = PRIMARY_READS if target == "UHF" else SECONDARY_READS
         _print_target_report(target, writes, reads)
+    if scenario["mode"] == "TC2_FAILOVER":
+        main_address, red_address = scenario_i2c_addresses(scenario, board_profile)
+        _print_failover_report(board_profile, main_address, red_address)
 
     if COMMAND_HISTORY_DROPPED:
         print("  Note: %d command(s) exceeded the history limit" %
@@ -1070,6 +1161,11 @@ def scenario_i2c_addresses(scenario, board_profile=BOARD_PROFILE):
         return SHARED_UHF_ADDRESS, SHARED_AIS_ADDRESS
     if address_set == "shared_redundant":
         return SHARED_UHF_REDUNDANT_ADDRESS, SHARED_AIS_REDUNDANT_ADDRESS
+    if address_set == "main_to_red":
+        # (starting main address, failover redundant address) on one block
+        return ((SECONDARY_MAIN_ADDRESS, SECONDARY_REDUNDANT_ADDRESS)
+                if board_profile == "AIS" else
+                (PRIMARY_MAIN_ADDRESS, PRIMARY_REDUNDANT_ADDRESS))
     raise ValueError("Unsupported address_set: %r" % address_set)
 
 
@@ -1099,12 +1195,12 @@ def validate_session(session):
 
     mode = scenario.get("mode")
     if mode not in ("POWER_ON_ALL", "SEQUENTIAL_TC", "NO_DEPLOY",
-                    "PAIR_TEST", "SHARED_I2C_DEPLOYMENT"):
+                    "PAIR_TEST", "SHARED_I2C_DEPLOYMENT", "TC2_FAILOVER"):
         raise ValueError("Unsupported mode: %r" % mode)
     scenario_i2c_addresses(scenario, board_profile)
     if mode == "POWER_ON_ALL":
         _nonnegative_number(scenario.get("delay_s"), "POWER_ON_ALL delay_s")
-    if mode in ("SEQUENTIAL_TC", "SHARED_I2C_DEPLOYMENT"):
+    if mode in ("SEQUENTIAL_TC", "SHARED_I2C_DEPLOYMENT", "TC2_FAILOVER"):
         _nonnegative_number(scenario.get("tc1_delay_s"), "tc1_delay_s")
         _nonnegative_number(scenario.get("tc2_delay_s"), "tc2_delay_s")
     if mode == "PAIR_TEST":
@@ -1130,6 +1226,19 @@ def validate_session(session):
         if DI_PIN in (SHARED_SDA, SHARED_SCL):
             raise ValueError("DI_PIN must not collide with shared I2C GPIOs")
         _nonnegative_number(SHARED_HANDOFF_DELAY_MS, "SHARED_HANDOFF_DELAY_MS")
+        return True
+
+    if mode == "TC2_FAILOVER":
+        if scenario.get("address_set") != "main_to_red":
+            raise ValueError("TC2_FAILOVER requires address_set main_to_red")
+        main_address, red_address = scenario_i2c_addresses(scenario, board_profile)
+        if main_address == red_address:
+            raise ValueError("TC2_FAILOVER main and redundant addresses must differ")
+        validate_i2c_target_config("FAILOVER", PRIMARY_I2C_ID, main_address, PRIMARY_SDA, PRIMARY_SCL)
+        validate_i2c_target_config("FAILOVER", PRIMARY_I2C_ID, red_address, PRIMARY_SDA, PRIMARY_SCL)
+        if DI_PIN in (PRIMARY_SDA, PRIMARY_SCL):
+            raise ValueError("DI_PIN must not collide with failover I2C GPIOs")
+        _nonnegative_number(FAILOVER_SWITCH_DELAY_MS, "FAILOVER_SWITCH_DELAY_MS")
         return True
 
     primary_address, secondary_address = scenario_i2c_addresses(scenario, board_profile)
@@ -1160,6 +1269,7 @@ def reset_session_report():
     RESPONSE_HISTORY[:] = []
     RESPONSE_HISTORY_DROPPED = 0
     LAST_RESPONSE_BY_TARGET.clear()
+    ADDRESS_EVENTS[:] = []
 
 
 def _make_di_pin():
@@ -1179,6 +1289,11 @@ def configure_session_hardware(session):
         if scenario["mode"] == "SHARED_I2C_DEPLOYMENT":
             slaves.append(make_slave(
                 SHARED_I2C_ID, primary_address, SHARED_SDA, SHARED_SCL))
+        elif scenario["mode"] == "TC2_FAILOVER":
+            # One block only: it starts on main and later moves to redundant.
+            # I2C1 stays disabled so no second target is exposed.
+            slaves.append(make_slave(
+                PRIMARY_I2C_ID, primary_address, PRIMARY_SDA, PRIMARY_SCL))
         else:
             if board_profile == "AIS":
                 # The bench exposes only Pico I2C0 for AIS.  Select either
@@ -1486,6 +1601,82 @@ def run_shared_i2c_deployment(session, slave, di, console):
     return start_ms, time.ticks_ms(), outcome
 
 
+def run_tc2_failover_session(session, slave, di, console):
+    """TC1 on main; TC2 ACKed on main without deploying, then on redundant."""
+    global PRIMARY_WRITES, PRIMARY_READS, SECONDARY_WRITES, SECONDARY_READS
+    scenario = session["scenario"]
+    main_address, red_address = scenario_i2c_addresses(scenario, session["board_profile"])
+    target = "AIS" if session["board_profile"] == "AIS" else "UHF"
+    sim = DeploymentSim(scenario)
+    switch_at = None        # tick to move to redundant; None = no switch pending
+    tc2_on_red = False      # TC2 has been commanded through the redundant address
+    outcome = None          # None, "abort", or the session to switch to
+    loop_max_us = 0
+    start_ms = time.ticks_ms()
+    duration_ms = _session_duration_ms(session)
+    while (duration_ms is None or
+           time.ticks_diff(time.ticks_ms(), start_ms) < duration_ms):
+        pass_start_us = time.ticks_us()
+        now = time.ticks_ms()
+        power_on = _read_power(di)
+        read_served = False
+        bus_activity = False
+        for cmd in slave.read_pending():
+            bus_activity = True
+            record_obc_command(now, start_ms, target, slave.address, cmd)
+            if target == "UHF": PRIMARY_WRITES += 1
+            else: SECONDARY_WRITES += 1
+            if cmd == SIM_RESET_COMMAND:
+                sim.reset()
+                switch_at, tc2_on_red = None, False
+                if slave.address != main_address:
+                    ADDRESS_EVENTS.append((time.ticks_diff(now, start_ms),
+                                           slave.address, main_address, "SIM_RESET"))
+                    slave.set_address(main_address)
+                continue
+            sim.apply_command(cmd)
+            if slave.address == main_address:
+                # Arm the switch only for TC2 after the TC1 pair is out, so an
+                # unexpected early TC2 cannot move the target off main.
+                if (cmd & (1 << TC2)) and sim.sequence_phase == 1 and switch_at is None:
+                    switch_at = time.ticks_add(now, FAILOVER_SWITCH_DELAY_MS)
+            elif cmd & (1 << TC2):
+                tc2_on_red = True
+        if slave.read_requested():
+            bus_activity = True
+            reg = sim.assemble()
+            slave.send_byte(reg)
+            read_served = True
+            _record_response(now, start_ms, target, slave, reg)
+            if target == "UHF": PRIMARY_READS += 1
+            else: SECONDARY_READS += 1
+        if console is not None:
+            line = console.service(now, read_served)
+            if line is not None:
+                targets = [(target, slave.address, sim, True)]
+                action = handle_runtime_command(
+                    line, session, start_ms, now, power_on, targets, loop_max_us)
+                if action == "end":
+                    break
+                elif action is not None:
+                    outcome = action
+                    break
+        sim.update_tc2_failover(power_on, now, scenario, tc2_on_red)
+        if switch_at is not None:
+            if bus_activity or slave.is_busy():
+                # Never re-address mid-transfer: restart the idle guard.
+                switch_at = time.ticks_add(now, FAILOVER_SWITCH_DELAY_MS)
+            elif time.ticks_diff(now, switch_at) >= 0:
+                slave.set_address(red_address)
+                switch_at = None
+                ADDRESS_EVENTS.append((time.ticks_diff(now, start_ms),
+                                       main_address, red_address,
+                                       "TC2 ACKed on main, bus idle"))
+        loop_max_us = max(loop_max_us, time.ticks_diff(time.ticks_us(), pass_start_us))
+        time.sleep_ms(POLL_MS)
+    return start_ms, time.ticks_ms(), outcome
+
+
 def _disable_slaves(slaves):
     for slave in slaves:
         slave.disable()
@@ -1503,6 +1694,9 @@ def run_session(session):
         print_session_ack(session)
         if session["scenario"]["mode"] == "SHARED_I2C_DEPLOYMENT":
             start_ms, end_ms, outcome = run_shared_i2c_deployment(
+                session, slaves[0], di, console)
+        elif session["scenario"]["mode"] == "TC2_FAILOVER":
+            start_ms, end_ms, outcome = run_tc2_failover_session(
                 session, slaves[0], di, console)
         else:
             start_ms, end_ms, outcome = run_normal_session(

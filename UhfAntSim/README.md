@@ -237,19 +237,21 @@ the full internal scenario name even though the laptop selects it by short ID.
 | `test16` | `redundant_deploy` | Redundant | Normal sequential behavior on redundant addresses |
 | `test17` | `shared_i2c_deployment` | Shared (main) | UHF and AIS ignore power-only deployment and require TC1 then TC2; I2C0 hands off from `0x45` to `0x47` |
 | `test18` | `shared_i2c_deployment_redundant` | Shared (redundant) | Same handoff as `test17`, but both boards answer on their redundant addresses; I2C0 hands off from `0x46` to `0x48` |
+| `test20` | `tc2_failover_main_to_red` | Main → redundant | TC1 deploys on `0x45`; TC2 is ACKed on `0x45` but does not deploy; I2C0 moves to `0x46` and the OBC's timed-out TC2 retry deploys ANT3/ANT4 there |
 
 Main sessions expose UHF `0x45` and AIS `0x47`. Redundant sessions expose UHF
 `0x46` and AIS `0x48`.
 
 ### AIS-only scenarios
 
-The same simulator also accepts `ais01` through `ais16` for AIS-focused runs.
+The same simulator also accepts `ais01` through `ais16`, plus `ais20`, for AIS-focused runs.
 These commands reuse the corresponding scenario behavior above, select the AIS
 target in the GDS event stream, and expose only one AIS controller address on
 Pico I²C0 (main `0x47` for `ais01`–`ais09` and redundant `0x48` for
 `ais10`–`ais16`). `ais17`/`ais18` are intentionally not defined because
 `test17`/`test18` already cover the shared-I²C UHF-to-AIS handoff (main and
-redundant addresses respectively). The AIS runner defaults the HIL
+redundant addresses respectively). `ais20` runs the `test20` failover on AIS
+`0x47` → `0x48`. The AIS runner defaults the HIL
 `obc_di` control pin to GP26; override it with `--test-flight-pin` if the bench
 wiring differs.
 
@@ -278,6 +280,34 @@ bridge separate buses.
 redundant addresses: it begins as UHF at `0x46` and, after the same handoff
 guard interval, switches the same I2C0 block to AIS at `0x48`.
 
+## TC2 main-to-redundant failover (`test20`/`ais20`)
+
+Only Pico I2C0 (GP20/GP21) is enabled; I2C1 stays off. The target starts on the
+main address (UHF `0x45`, AIS `0x47`):
+
+1. UHF only: the OBC waits up to 100 s for a power-only deployment, which does
+   not happen.
+2. TC1 on main is accepted and deploys ANT1/ANT2 after `tc1_delay_s`.
+3. The OBC sends TC2 to main. It is ACKed and shown in the register, but does
+   not deploy.
+4. Once that TC2 write has been received and the bus has stayed idle for
+   `FAILOVER_SWITCH_DELAY_MS` (20 ms; reset by any transfer or by the RP2040
+   slave-activity bit), the same block is re-addressed to redundant (UHF
+   `0x46`, AIS `0x48`). The switch arms only after the TC1 pair is deployed.
+5. The OBC keeps polling about once a second; each status read fails on main
+   and falls back to redundant, so it never sees a read failure on both.
+6. After the OBC's 100 s TC2 timeout it re-sends TC2 to redundant, which
+   deploys ANT3/ANT4 after `tc2_delay_s`, completing the deployment.
+
+The OBC reports `SUCCESS` about 110 s after the deployment starts for AIS, and
+about 210 s for UHF. If the switch never happens, the OBC's redundant TC2
+write is NACKed and it reports `ERROR_I2C_WRITE_TC2_FAILED`. The report adds
+an `ADDRESS FAILOVER` section listing the switch time, when TC1-on-main,
+TC2-on-main and TC2-on-redundant were seen, the TC2 main→redundant gap, and a
+`PASS`/`INCOMPLETE` result. Because UHF needs about 210 s plus boot, run it
+with a longer session (for example `test20 600`) and a host status wait
+above the 240 s default.
+
 ## Report behavior
 
 When `REPORT = True`, the simulator records bounded command and response
@@ -289,6 +319,7 @@ disables every I2C target and then prints the report over USB. The report:
 2. Filters normal-session output using `BOARD_PROFILE`.
 3. Prints separate UHF and AIS command, response, and final-result sections for
    shared `test17`/`test18` sessions.
+   `test20`/`ais20` also print an `ADDRESS FAILOVER` section.
 4. Compresses repeated identical responses and includes their read count.
 5. Uses the last status byte actually returned to each board as its final result.
 
