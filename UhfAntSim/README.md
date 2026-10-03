@@ -14,10 +14,14 @@ report, and waits for the next command.
 
 | Function | Pico peripheral | Pico pins | Main address | Redundant address |
 |---|---:|---|---:|---:|
-| UHF target | I2C0 | SDA GP20, SCL GP21 | `0x45` | `0x46` |
-| AIS target | I2C1 | SDA GP26, SCL GP27 | `0x47` | `0x48` |
+| UHF target (`testNN`) | I2C0 | SDA GP20, SCL GP21 | `0x45` | `0x46` |
+| AIS target (`aisNN`, after the `test17`/`test18` handoff) | I2C0 | SDA GP20, SCL GP21 | `0x47` | `0x48` |
 | Antenna power input | GPIO | GP15 | N/A | N/A |
 | Session control/report | USB CDC/REPL | Pico micro-USB | N/A | N/A |
+
+Every session exposes one target on Pico I2C0; I2C1 is never enabled. A
+session uses either one address for its whole duration or re-addresses I2C0
+mid-session on an idle bus (failover and shared-bus tests).
 
 Connect the Pico and OBC grounds together. The OBC controls the I2C clock; the
 target is intended for a 100 kHz bus. External I2C pull-ups are preferred for
@@ -126,13 +130,15 @@ port.
 These source settings apply to every short command:
 
 ```python
-BOARD_PROFILE = "UHF"                 # "UHF" or "AIS"
 DEFAULT_SESSION_DURATION_S = 400     # overridden by "testNN <s|none>"
-DUAL_ADDRESS = True
 TC_REQUIRES_POWER = True
 
-TC1_DEPLOY_DELAY_S = 5
-TC2_DEPLOY_DELAY_S = 5
+TC1_DEPLOY_DELAY_S = 5                # UHF
+TC2_DEPLOY_DELAY_S = 5                # UHF
+
+AIS_TC1_DEPLOY_MASK = 0x0F            # antenna bits 0-3 that AIS TC1 deploys
+AIS_TC1_DEPLOY_DELAY_S = 5            # AIS TC1 burn time (TBD)
+AIS_PARTIAL_DEPLOY_MASK = 0x03        # used only by ais05
 
 REPORT = True
 ```
@@ -143,13 +149,24 @@ selects the scenario. Its delays and address set come from `SCENARIOS`.
 
 Important behavior:
 
-- `BOARD_PROFILE` selects the board shown in the report and prevents AIS from
-  using a power-on deployment scenario.
+- The command prefix selects the board: `testNN` is UHF (or the shared
+  UHF→AIS handoff) and `aisNN` is AIS. A UHF scenario cannot run as AIS and
+  vice versa.
+- `AIS_TC1_DEPLOY_MASK` must match the AIS success check in the OBC firmware.
+  Today's AISMgr treats AIS as deployed only when bits 0-3 are all `0`, so keep
+  `0x0F` unless the AIS firmware checks fewer bits. A mask of `0` or one with
+  bits outside 0-3 is rejected when a session starts.
+- `AIS_PARTIAL_DEPLOY_MASK` (ais05 only) must leave at least one bit of
+  `AIS_TC1_DEPLOY_MASK` stored; a value that would fully deploy AIS is rejected
+  when the session starts.
+- Each AIS scenario is checked when its session starts: a test expecting full
+  deployment must clear every bit of `AIS_TC1_DEPLOY_MASK`, a switch to
+  redundant requires main to ignore TC1, and the `expect` block must be
+  complete. A bad scenario answers `NACK=INVALID` instead of running.
 - The session duration (default, per-command, or `none`) applies even when
   `REPORT = False`.
-- `DUAL_ADDRESS = True` normally creates independent UHF and AIS targets.
 - `TC_REQUIRES_POWER = True` requires GP15 antenna power before a cutter can
-  deploy its pair.
+  deploy (UHF and AIS).
 - Deployment timers reset if their required condition disappears early.
 - Report history and deployment state are reset for every new session.
 - The bench-only I2C command `0x80` resets deployment state during a session.
@@ -196,21 +213,35 @@ an OBC write is the command byte and an OBC read returns current status.
 | 4 | TC1 | OBC to Pico/status | `1` means TC1 commanded |
 | 5 | TC2 | OBC to Pico/status | `1` means TC2 commanded |
 | 6 | Unused | — | Always `0` |
-| 7 | Signature | Pico to OBC | `1` when `READ_SIGNATURE = True` |
+| 7 | Signature | Pico to OBC | `0` by default (flight-like); `1` when `READ_SIGNATURE = True` |
 
 Common writes are `0x00` for cutters off, `0x10` for TC1, `0x20` for TC2,
 `0x30` for both cutters, and the bench-only reset command `0x80`.
 
-With `READ_SIGNATURE = True`, common responses include:
+The AIS board uses the same register but has a single cutter. Only TC1 has an
+effect: it deploys the bits in `AIS_TC1_DEPLOY_MASK`. Bit 5 (TC2) always reads
+`0` on AIS, a TC2 write is ignored, and power alone never deploys AIS. With the
+default mask an AIS run reads `0x0F` (all stored), `0x1F` (TC1 on), then
+`0x10` (all deployed, TC1 still on).
+
+With the default `READ_SIGNATURE = False`, bits 6 and 7 (NC on the flight
+board) read `0`, so common responses include:
+
+UHF responses:
 
 | Response | Feedback state | Cutter state |
 |---:|---|---|
-| `0x8F` | All four antennas stored | Both off |
-| `0x9F` | All four antennas stored | TC1 on |
-| `0x9C` | ANT1/ANT2 deployed | TC1 on |
-| `0xAC` | ANT1/ANT2 deployed | TC2 on |
-| `0xA3` | ANT3/ANT4 deployed | TC2 on |
-| `0xA0` | All four antennas deployed | TC2 on |
+| `0x0F` | All four antennas stored | Both off |
+| `0x1F` | All four antennas stored | TC1 on |
+| `0x1C` | ANT1/ANT2 deployed | TC1 on |
+| `0x2C` | ANT1/ANT2 deployed | TC2 on |
+| `0x23` | ANT3/ANT4 deployed | TC2 on |
+| `0x20` | All four antennas deployed | TC2 on |
+
+Set `READ_SIGNATURE = True` for a bench check: bit 7 is then set on every read
+(`0x8F`, `0x9F`, `0x9C`, `0xAC`, `0xA3`, `0xA0`), which proves the OBC is
+reading the Pico and not a floating or stuck bus. The OBC masks only bits 0-3,
+so its behaviour is identical either way.
 
 ## Test commands and scenarios
 
@@ -235,25 +266,51 @@ the full internal scenario name even though the laptop selects it by short ID.
 | `test14` | `test14_redundant_tc1_ignored_tc2_deploy` | Redundant | TC1 rejected; TC2 deploys Pair 2 |
 | `test15` | `test15_redundant_ignore_all` | Redundant | Both cutter commands rejected |
 | `test16` | `redundant_deploy` | Redundant | Normal sequential behavior on redundant addresses |
-| `test17` | `shared_i2c_deployment` | Shared (main) | UHF and AIS ignore power-only deployment and require TC1 then TC2; I2C0 hands off from `0x45` to `0x47` |
+| `test17` | `shared_i2c_deployment` | Shared (main) | UHF ignores power-only deployment and needs TC1 then TC2; I2C0 then hands off from `0x45` to AIS `0x47`, where TC1 alone deploys AIS |
 | `test18` | `shared_i2c_deployment_redundant` | Shared (redundant) | Same handoff as `test17`, but both boards answer on their redundant addresses; I2C0 hands off from `0x46` to `0x48` |
 | `test20` | `tc2_failover_main_to_red` | Main → redundant | TC1 deploys on `0x45`; TC2 is ACKed on `0x45` but does not deploy; I2C0 moves to `0x46` and the OBC's timed-out TC2 retry deploys ANT3/ANT4 there |
+| `test21` | `main_lost_after_tc1` | Main → redundant | TC1 deploys on `0x45`; I2C0 then moves to `0x46` before TC2, so the OBC's TC2 write to main is NACKed and its next-tick retry deploys ANT3/ANT4 on `0x46` |
 
-Main sessions expose UHF `0x45` and AIS `0x47`. Redundant sessions expose UHF
-`0x46` and AIS `0x48`.
+Main sessions expose UHF `0x45` only; redundant sessions expose UHF `0x46`
+only. No AIS target is exposed during `test01`–`test16`, `test20` or `test21`.
 
-### AIS-only scenarios
+### AIS scenarios (single cutter, TC1 only)
 
-The same simulator also accepts `ais01` through `ais16`, plus `ais20`, for AIS-focused runs.
-These commands reuse the corresponding scenario behavior above, select the AIS
-target in the GDS event stream, and expose only one AIS controller address on
-Pico I²C0 (main `0x47` for `ais01`–`ais09` and redundant `0x48` for
-`ais10`–`ais16`). `ais17`/`ais18` are intentionally not defined because
-`test17`/`test18` already cover the shared-I²C UHF-to-AIS handoff (main and
-redundant addresses respectively). `ais20` runs the `test20` failover on AIS
-`0x47` → `0x48`. The AIS runner defaults the HIL
-`obc_di` control pin to GP26; override it with `--test-flight-pin` if the bench
-wiring differs.
+AIS has its own tests. They run on Pico I2C0 at the AIS addresses and follow
+the TC1-only model above. The old `ais01`–`ais16`, `ais20` and `ais21` aliases
+of the UHF tests are retired; `ais06` and above now answer `NACK=INVALID`.
+
+| USB command | Internal scenario | Pico behavior | Expected OBC result |
+|---|---|---|---|
+| `ais01` | `ais01_tc1_main_deploy` | TC1 on `0x47` deploys | `SUCCESS`, states `1-2-3-5-6-11`, ~10 s |
+| `ais02` | `ais02_tc1_main_ignored_red_deploy` | TC1 ACKed on `0x47` but ignored; I2C0 moves to `0x48`; TC1 there deploys | `SUCCESS` after the 100 s TC1 timeout, states `1-2-3-5-6-7-6-11`, ~111 s |
+| `ais03` | `ais03_redundant_only_tc1_deploy` | Only `0x48` present; TC1 on main is NACKed; TC1 on `0x48` deploys | `SUCCESS`, states `1-2-3-5-7-6-11`, ~11 s |
+| `ais04` | `ais04_tc1_ignored_both` | TC1 ignored on `0x47`, I2C0 moves to `0x48`, TC1 ignored there too | `ERROR_DEPLOYMENT_TIMEOUT`, states `1-2-3-5-6-7-6-12`, ~205 s |
+| `ais05` | `ais05_tc1_partial_deploy` | TC1 on `0x47` deploys only `AIS_PARTIAL_DEPLOY_MASK` | Failure, ~105-112 s (see below) |
+
+The expected results are for both the current AISMgr (which still runs a
+TC1→TC2 sequence for AIS) and the expected TC1-only AIS firmware; `ais01`–`ais04`
+give the same states in both. `ais05` differs: the TC1-only firmware times out
+on TC1 and then fails writing TC1 to the absent redundant
+(`ERROR_I2C_WRITE_TC1_FAILED`, `1-2-3-5-6-7-12`). The current firmware sees
+ANT1/ANT2 deployed, sends TC2 (ignored, and flagged as a warning in the
+report), times out and fails writing TC2 to redundant
+(`ERROR_I2C_WRITE_TC2_FAILED`, `1-2-3-5-6-8-9-10-12`). The AIS behaviour is
+provisional until the TC1-only AIS change lands in `obc_fsw`.
+
+Each AIS report ends with an `AIS TC1-ONLY CHECK` section. It shows which bits
+this scenario's TC1 clears and which bits count as deployed
+(`AIS_TC1_DEPLOY_MASK`), any address switch, whether TC1 reached main and
+redundant, the final antenna state, and `Scenario result: AS EXPECTED` or
+`UNEXPECTED`, judged against the scenario's expected path. "Deployed" means
+every bit of `AIS_TC1_DEPLOY_MASK` reads `0`, so the verdict stays correct if
+that mask is changed to match the firmware. It only counts the run after the last bench `0x80` reset. Any
+TC2 write that reaches AIS is reported as a `WARNING`.
+
+The AIS runner defaults the HIL `obc_di` control pin to GP26; override it with
+`--test-flight-pin` if the bench wiring differs. The runner in `obc_fsw` still
+lists the old `--ais01`–`--ais16` options, so check it matches these commands
+before running AIS tests through it.
 
 Example:
 
@@ -272,7 +329,8 @@ does not deploy UHF from power alone: TC1 must deploy ANT1/ANT2 and TC2 must
 then deploy ANT3/ANT4. It keeps `0x45` until the OBC reads the final UHF
 deployed status, waits the configured handoff guard interval, and changes the
 same hardware block to AIS at `0x47`. AIS starts with all antennas stored and
-also requires TC1 followed by TC2; power alone does not deploy it. The harness
+follows the TC1-only model: TC1 alone deploys it, and power alone does not.
+These are happy-path tests; AIS failure cases are covered by `ais02`–`ais05`. The harness
 must route both OBC transactions to this physical bus; the simulator cannot
 bridge separate buses.
 
@@ -280,33 +338,56 @@ bridge separate buses.
 redundant addresses: it begins as UHF at `0x46` and, after the same handoff
 guard interval, switches the same I2C0 block to AIS at `0x48`.
 
-## TC2 main-to-redundant failover (`test20`/`ais20`)
+## TC2 main-to-redundant failover (`test20`)
 
 Only Pico I2C0 (GP20/GP21) is enabled; I2C1 stays off. The target starts on the
-main address (UHF `0x45`, AIS `0x47`):
+UHF main address `0x45`:
 
-1. UHF only: the OBC waits up to 100 s for a power-only deployment, which does
-   not happen.
+1. The OBC waits up to 100 s for a power-only deployment, which does not
+   happen.
 2. TC1 on main is accepted and deploys ANT1/ANT2 after `tc1_delay_s`.
 3. The OBC sends TC2 to main. It is ACKed and shown in the register, but does
    not deploy.
 4. Once that TC2 write has been received and the bus has stayed idle for
    `FAILOVER_SWITCH_DELAY_MS` (20 ms; reset by any transfer or by the RP2040
-   slave-activity bit), the same block is re-addressed to redundant (UHF
-   `0x46`, AIS `0x48`). The switch arms only after the TC1 pair is deployed.
+   slave-activity bit), the same block is re-addressed to redundant `0x46`.
+   The switch arms only after the TC1 pair is deployed.
 5. The OBC keeps polling about once a second; each status read fails on main
    and falls back to redundant, so it never sees a read failure on both.
 6. After the OBC's 100 s TC2 timeout it re-sends TC2 to redundant, which
    deploys ANT3/ANT4 after `tc2_delay_s`, completing the deployment.
 
-The OBC reports `SUCCESS` about 110 s after the deployment starts for AIS, and
-about 210 s for UHF. If the switch never happens, the OBC's redundant TC2
+The OBC reports `SUCCESS` about 210 s after the deployment starts. If the switch never happens, the OBC's redundant TC2
 write is NACKed and it reports `ERROR_I2C_WRITE_TC2_FAILED`. The report adds
 an `ADDRESS FAILOVER` section listing the switch time, when TC1-on-main,
 TC2-on-main and TC2-on-redundant were seen, the TC2 main→redundant gap, and a
 `PASS`/`INCOMPLETE` result. Because UHF needs about 210 s plus boot, run it
 with a longer session (for example `test20 600`) and a host status wait
 above the 240 s default.
+
+## Main lost after TC1 (`test21`)
+
+This models the main controller disappearing mid-deployment. Only Pico I2C0 is
+enabled, starting on the UHF main address `0x45`:
+
+1. The OBC waits up to 100 s for a power-only deployment, which does not
+   happen.
+2. TC1 on main is accepted and deploys ANT1/ANT2 after `tc1_delay_s`.
+3. After the Pico serves the read showing the TC1 pair deployed, and the bus
+   has stayed idle for `FAILOVER_SWITCH_DELAY_MS` (20 ms), I2C0 moves to
+   redundant `0x46`. The OBC's next tick is about 1 s away.
+4. The OBC's TC2 write to main is NACKed, because no target holds that address,
+   so the Pico never sees it.
+5. On its next tick the OBC sends TC2 to redundant, which deploys ANT3/ANT4
+   after `tc2_delay_s`.
+
+OBC states: `1-2-3-4-5-6-8-10-9-11`, reaching `SUCCESS` about 111 s after the
+deployment starts. The report adds a `MAIN LOST AFTER TC1` section listing the
+switch time; TC1 on main, TC2 on main and TC2 on redundant; the switch to
+TC2-on-redundant gap; and a `PASS`/`INCOMPLETE` result. `TC2 on main` must be
+`NOT SEEN`. If it is seen, the switch was late and the run took the `test20`
+timeout path instead, so the result is `INCOMPLETE` even if the OBC reports
+`SUCCESS`. The verdict only counts the run after the last bench `0x80` reset.
 
 ## Report behavior
 
@@ -316,10 +397,12 @@ runtime `end`/`testNN`), it first
 disables every I2C target and then prints the report over USB. The report:
 
 1. Uses the full internal scenario name.
-2. Filters normal-session output using `BOARD_PROFILE`.
+2. Prints the UHF sections for `testNN` and the AIS sections for `aisNN`.
 3. Prints separate UHF and AIS command, response, and final-result sections for
-   shared `test17`/`test18` sessions.
-   `test20`/`ais20` also print an `ADDRESS FAILOVER` section.
+   shared `test17`/`test18` sessions. AIS sections show antennas deployed out of
+   4 instead of the UHF TC1/TC2 pairs.
+   `test20` also prints an `ADDRESS FAILOVER` section, `test21` a
+   `MAIN LOST AFTER TC1` section, and `aisNN` an `AIS TC1-ONLY CHECK` section.
 4. Compresses repeated identical responses and includes their read count.
 5. Uses the last status byte actually returned to each board as its final result.
 
