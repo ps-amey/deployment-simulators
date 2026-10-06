@@ -1,6 +1,6 @@
 # UHF/AIS Antenna Deployment Simulator
 
-`uhfAntSim.py` runs on a Raspberry Pi Pico using MicroPython. The Pico acts as
+`uhfantsim.py` runs on a Raspberry Pi Pico using MicroPython. The Pico acts as
 an I2C target and emulates the status/command register used by the UHF and AIS
 antenna deployment boards.
 
@@ -16,7 +16,7 @@ report, and waits for the next command.
 |---|---:|---|---:|---:|
 | UHF target (`testNN`) | I2C0 | SDA GP20, SCL GP21 | `0x45` | `0x46` |
 | AIS target (`aisNN`, after the `test17`/`test18` handoff) | I2C0 | SDA GP20, SCL GP21 | `0x47` | `0x48` |
-| Antenna power input | GPIO | GP15 | N/A | N/A |
+| Antenna power input (through a voltage divider) | GPIO | GP15 | N/A | N/A |
 | Session control/report | USB CDC/REPL | Pico micro-USB | N/A | N/A |
 
 Every session exposes one target on Pico I2C0; I2C1 is never enabled. A
@@ -27,6 +27,17 @@ Connect the Pico and OBC grounds together. The OBC controls the I2C clock; the
 target is intended for a 100 kHz bus. External I2C pull-ups are preferred for
 reliable bench operation, although `INTERNAL_PULLUPS` can enable the Pico's
 weak internal pull-ups.
+
+GP15 senses antenna power. It is active high with the Pico's internal
+pull-down enabled, so an unconnected pin reads as power off. The antenna power
+signal reaches GP15 through a voltage divider; Pico GPIOs are 3.3 V and not
+5 V tolerant, so never connect a 5 V signal to it directly.
+
+Install the simulator once as the Pico's `main.py`, so it starts on every boot:
+
+```bash
+mpremote connect /dev/ttyACMx cp uhfantsim.py :main.py + reset
+```
 
 ## USB session protocol
 
@@ -42,15 +53,42 @@ Send one case-insensitive ASCII test command followed by a newline:
 test12\n
 ```
 
-An optional second word sets the session length in seconds; `none` runs until
-a runtime `end` or `abort`. Without it the session lasts
-`DEFAULT_SESSION_DURATION_S` (400 s):
+The full form is:
 
-| Command | Session length |
+```text
+testNN [duration_s|none] [tc_delay_s] [power_delay_s]
+```
+
+Every field after the test ID is optional and positional. `-` keeps a field's
+default, so a later field can be set without the earlier ones.
+
+| Field | Meaning | Default |
+|---|---|---|
+| `duration_s` | Session length in seconds; `none` runs until a runtime `end` or `abort` | `DEFAULT_SESSION_DURATION_S` (400 s) |
+| `tc_delay_s` | How long a cutter must stay commanded before its antennas deploy. One value covers every cutter: UHF TC1 and TC2, and AIS TC1 (including the AIS half of `test17`/`test18`) | `TC1_DEPLOY_DELAY_S`, `TC2_DEPLOY_DELAY_S`, `AIS_TC1_DEPLOY_DELAY_S` (5 s each) |
+| `power_delay_s` | How long antenna power must stay present before a power-only deployment (`test01`, `test06`–`test11`) | `PAIR_POWER_DEPLOY_DELAY_S` (5 s) |
+
+| Command | Effect |
 |---|---|
-| `test12` | 400 s (default) |
-| `test12 500` | 500 s |
-| `test12 none` | Until `end` or `abort` |
+| `test12` | 400 s, default delays |
+| `test12 500` | 500 s, default delays |
+| `test12 none` | Until `end` or `abort`, default delays |
+| `test12 600 20` | 600 s, every cutter needs 20 s |
+| `test01 none 50 100` | Until `end`/`abort`, TC delay 50 s, power deploys after 100 s |
+| `test01 - - 100` | Default duration and TC delay, power deploys after 100 s |
+
+A delay is a whole number of seconds from 0 to `MAX_SESSION_DURATION_S`. A
+delay that the scenario never uses (for example a power delay with `test02`) is
+accepted and has no effect. Terminate the command with `\r\n` or `\n`; a lone
+`\r` ends a runtime command but not a command sent at `CONFIG_READY`.
+
+Choose delays against the OBC's own timeouts. The OBC waits about 100 s for a
+power-only deployment and about 100 s for each cutter command, so a delay at or
+above 100 s, or one close to it, changes which path the OBC takes (for example
+`test01 none 50 100` races the OBC's power-only wait). A cutter delay also only
+counts while the OBC keeps that cutter commanded; if the OBC clears the TC bit
+before the delay has elapsed, the timer restarts and the pair never deploys. A
+delay longer than the session duration never deploys.
 
 The duration must be a whole number from 1 to `MAX_SESSION_DURATION_S`
 (500000 s, about 5.8 days, the range MicroPython's millisecond tick arithmetic
@@ -66,12 +104,16 @@ ACK=test12
 
 The laptop may start the OBC/HIL test only after receiving the ACK. During the
 active session the Pico accepts the runtime commands described below. At the
-end it disables I2C, prints the report when `REPORT = True`, then prints:
+end it disables I2C, prints the report when `REPORT = True`, then a one-line
+JSON summary and the completion lines:
 
 ```text
+RESULT {"test": "test12", "outcome": "complete", "verdict": null, ...}
 SESSION_COMPLETE
 CONFIG_READY
 ```
+
+See [Session result line](#session-result-line) for the `RESULT` fields.
 
 Blank lines are ignored. Invalid or oversized commands produce:
 
@@ -103,8 +145,8 @@ newline-terminated, case-insensitive commands:
 |---|---|---|
 | `status` | One-line snapshot: elapsed time, session duration, power input, worst loop pass, and per target the address, register, sequence phase, deployed flag, and read/write counts (`*` marks the active target) | `RT_STATUS ...` |
 | `end` | Ends the session now: I2C disabled, report, `SESSION_COMPLETE`, `CONFIG_READY` | `RT_ACK=end` |
-| `abort` | Ends the session now without a report: I2C disabled, `SESSION_ABORTED`, `CONFIG_READY` | `RT_ACK=abort` |
-| `testNN [seconds\|none]` / `aisNN [seconds\|none]` | Ends the current session like `end`, then starts the new test directly with `ACK=testNN` and no `CONFIG_READY` in between; the duration works as it does at `CONFIG_READY` | `RT_ACK=testNN ...` |
+| `abort` | Ends the session now without a report: I2C disabled, `RESULT` (outcome `aborted`), `SESSION_ABORTED`, `CONFIG_READY` | `RT_ACK=abort` |
+| `testNN ...` / `aisNN ...` | Ends the current session like `end`, then starts the new test directly with `ACK=testNN` and no `CONFIG_READY` in between; the duration and delays work as they do at `CONFIG_READY` | `RT_ACK=testNN ...` |
 
 Unknown or invalid commands reply `RT_NACK=<command>` and the session keeps
 running. A command still waiting to run, or only partly received, when the
@@ -130,14 +172,15 @@ port.
 These source settings apply to every short command:
 
 ```python
-DEFAULT_SESSION_DURATION_S = 400     # overridden by "testNN <s|none>"
+DEFAULT_SESSION_DURATION_S = 400     # overridden by the command's duration
 TC_REQUIRES_POWER = True
 
-TC1_DEPLOY_DELAY_S = 5                # UHF
-TC2_DEPLOY_DELAY_S = 5                # UHF
+TC1_DEPLOY_DELAY_S = 5                # UHF; overridden by the command's tc_delay_s
+TC2_DEPLOY_DELAY_S = 5                # UHF; overridden by the command's tc_delay_s
+PAIR_POWER_DEPLOY_DELAY_S = 5         # overridden by the command's power_delay_s
 
 AIS_TC1_DEPLOY_MASK = 0x0F            # antenna bits 0-3 that AIS TC1 deploys
-AIS_TC1_DEPLOY_DELAY_S = 5            # AIS TC1 burn time (TBD)
+AIS_TC1_DEPLOY_DELAY_S = 5            # AIS TC1 burn time (TBD); overridden by tc_delay_s
 AIS_PARTIAL_DEPLOY_MASK = 0x03        # used only by ais05
 
 REPORT = True
@@ -213,7 +256,7 @@ an OBC write is the command byte and an OBC read returns current status.
 | 4 | TC1 | OBC to Pico/status | `1` means TC1 commanded |
 | 5 | TC2 | OBC to Pico/status | `1` means TC2 commanded |
 | 6 | Unused | — | Always `0` |
-| 7 | Signature | Pico to OBC | `0` by default (flight-like); `1` when `READ_SIGNATURE = True` |
+| 7 | Unused | — | Always `0` |
 
 Common writes are `0x00` for cutters off, `0x10` for TC1, `0x20` for TC2,
 `0x30` for both cutters, and the bench-only reset command `0x80`.
@@ -224,8 +267,8 @@ effect: it deploys the bits in `AIS_TC1_DEPLOY_MASK`. Bit 5 (TC2) always reads
 default mask an AIS run reads `0x0F` (all stored), `0x1F` (TC1 on), then
 `0x10` (all deployed, TC1 still on).
 
-With the default `READ_SIGNATURE = False`, bits 6 and 7 (NC on the flight
-board) read `0`, so common responses include:
+Bits 6 and 7 (NC on the flight board) always read `0`, so common responses
+include:
 
 UHF responses:
 
@@ -237,11 +280,6 @@ UHF responses:
 | `0x2C` | ANT1/ANT2 deployed | TC2 on |
 | `0x23` | ANT3/ANT4 deployed | TC2 on |
 | `0x20` | All four antennas deployed | TC2 on |
-
-Set `READ_SIGNATURE = True` for a bench check: bit 7 is then set on every read
-(`0x8F`, `0x9F`, `0x9C`, `0xAC`, `0xA3`, `0xA0`), which proves the OBC is
-reading the Pico and not a floating or stuck bus. The OBC masks only bits 0-3,
-so its behaviour is identical either way.
 
 ## Test commands and scenarios
 
@@ -407,12 +445,47 @@ disables every I2C target and then prints the report over USB. The report:
 5. Uses the last status byte actually returned to each board as its final result.
 
 Set `REPORT = False` to disable collection and printing. The session still
-ends after its duration. The report header shows both the configured duration
-and the actual elapsed time.
+ends after its duration. The report header shows the configured duration, the
+actual elapsed time, and the TC and power delays in use, each marked
+`(command)` or `(default)`; `n/a` means the scenario has no such deployment.
+
+## Session result line
+
+Every session ends with one `RESULT` line holding a JSON object, printed after
+the report and before `SESSION_COMPLETE` or `SESSION_ABORTED`. Host tools read
+this line instead of parsing the report:
+
+```text
+RESULT {"test": "test20", "scenario": "tc2_failover_main_to_red", "outcome": "complete", "verdict": "PASS", "duration_s": 600, "elapsed_s": 600.002, "tc_delay_s": 5, "power_delay_s": null, "obc_writes": {"UHF": 4}, "status_reads": {"UHF": 590}, "final": {"UHF": {"address": "0x46", "status": "0x20", "state": "ALL DEPLOYED", "last_read_s": 599.0}}, "address_switches": [{"t_s": 112.4, "from": "0x45", "to": "0x46", "reason": "..."}], "history_overflow": false}
+```
+
+| Field | Meaning |
+|---|---|
+| `test`, `scenario` | Short command and internal scenario name |
+| `outcome` | `complete` (duration expired, `end`, or a runtime `testNN`) or `aborted` |
+| `verdict` | `PASS`/`INCOMPLETE` for `test20`/`test21`, `AS EXPECTED`/`UNEXPECTED` for `aisNN`, otherwise `null`; always `null` when aborted |
+| `duration_s` | Configured session length; `null` for `none` |
+| `elapsed_s` | Actual session length |
+| `tc_delay_s`, `power_delay_s` | Delays in use; `null` when the scenario has no such deployment |
+| `obc_writes`, `status_reads` | Per-board OBC write and status-read counts |
+| `final` | Per board, the last status byte actually returned to the OBC, with its address and decoded state. Empty when `REPORT = False` |
+| `address_switches` | Every mid-session re-address of I2C0 |
+| `history_overflow` | `true` when the bounded command or response history overflowed |
+
+The OBC's pass/fail is decided by the host test, not by this line.
+
+`RESULT` is printed for every session that ends normally or by `abort`. If the
+report or the `RESULT` line itself fails to print (for example on a Pico memory
+error), the Pico prints `REPORT_ERROR reason=...` or `RESULT_ERROR reason=...`
+instead and still ends with `SESSION_COMPLETE` or `SESSION_ABORTED`. A failure
+while the session is running prints `RUNTIME_ERROR reason=...` and then
+`CONFIG_READY`, with no `RESULT`, so a host must treat `RUNTIME_ERROR` as the
+end of the session too. The JSON key order can differ between runs; read it as
+JSON, not by position.
 
 ## Running through the OBC HIL controller
 
-Copy `uhfAntSim.py` to the Pico as `main.py`, then run the host-side HIL
+Copy `uhfantsim.py` to the Pico as `main.py`, then run the host-side HIL
 controller from this `obc_fsw` checkout. Select one scenario with `--01`
 through `--17`:
 

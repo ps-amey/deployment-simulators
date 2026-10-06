@@ -15,19 +15,18 @@
 #    bit4  TC1  R/W  Thermal cutter 1   1 = ON, 0 = OFF
 #    bit5  TC2  R/W  Thermal cutter 2   1 = ON, 0 = OFF
 #    bit6  ---  --   unused (always 0)
-#    bit7  SIG  RO   0 (flight-like); bench signature when READ_SIGNATURE=True
+#    bit7  ---  --   unused (always 0, flight-like)
 #
 #  Master interaction (single-register device, no register-pointer byte):
 #    - Master WRITE of 1 byte  -> command; only TC bits (0x30) are applied.
 #    - Master READ  of 1 byte  -> current telemetry (freshly assembled).
 #  Examples:  write 0x10 -> TC1 on;  write 0x20 -> TC2 on;  write 0x30 -> both.
-#  With READ_SIGNATURE=False (default), staged sequential reads include:
+#  Staged sequential reads include:
 #       0x0F: all antennas stored
 #       0x1F: all stored, TC1 commanded
 #       0x1C: ANT1/ANT2 deployed, ANT3/ANT4 stored, TC1 commanded
 #       0x2C: first pair deployed, TC2 commanded
 #       0x20: all four deployed, TC2 commanded
-#  READ_SIGNATURE=True adds bit7 (0x80) to every read: 0x8F, 0x9F, ...
 #
 #  ---------------------------------------------------------------------------
 #  ONE TARGET ON PICO I2C0 / SELECTABLE MAIN OR REDUNDANT ADDRESS
@@ -51,6 +50,7 @@
 # =============================================================================
 
 import gc
+import json
 import machine
 import select
 import time
@@ -99,9 +99,6 @@ AIS_PARTIAL_DEPLOY_MASK = 0x03
 #
 # shared_i2c_deployment_redundant is the same handoff, but both boards answer
 # on their redundant addresses instead (UHF 0x46, then AIS 0x48).
-SHARED_I2C_ID = 0
-SHARED_SDA = 20
-SHARED_SCL = 21
 SHARED_UHF_ADDRESS = PRIMARY_MAIN_ADDRESS
 SHARED_AIS_ADDRESS = AIS_MAIN_ADDRESS
 SHARED_UHF_REDUNDANT_ADDRESS = PRIMARY_REDUNDANT_ADDRESS
@@ -197,7 +194,8 @@ PAIR_POWER_DEPLOY_DELAY_S = 5
 
 SCENARIOS = {
     "test01_power_on": {
-        "mode": "POWER_ON_ALL", "delay_s": 5, "address_set": "main"
+        "mode": "POWER_ON_ALL", "delay_s": PAIR_POWER_DEPLOY_DELAY_S,
+        "address_set": "main"
     },
     "test02_sequential_deploy": {
         "mode": "SEQUENTIAL_TC",
@@ -374,7 +372,7 @@ SCENARIOS = {
     },
     "shared_i2c_deployment": {
         "mode": "SHARED_I2C_DEPLOYMENT",
-        "uhf_power_delay_s": 5,
+        "uhf_power_delay_s": PAIR_POWER_DEPLOY_DELAY_S,
         "tc1_delay_s": TC1_DEPLOY_DELAY_S,
         "tc2_delay_s": TC2_DEPLOY_DELAY_S,
         "address_set": "shared",
@@ -383,7 +381,7 @@ SCENARIOS = {
     # on their redundant addresses (UHF 0x46, then AIS 0x48) instead of main.
     "shared_i2c_deployment_redundant": {
         "mode": "SHARED_I2C_DEPLOYMENT",
-        "uhf_power_delay_s": 5,
+        "uhf_power_delay_s": PAIR_POWER_DEPLOY_DELAY_S,
         "tc1_delay_s": TC1_DEPLOY_DELAY_S,
         "tc2_delay_s": TC2_DEPLOY_DELAY_S,
         "address_set": "shared_redundant",
@@ -507,7 +505,6 @@ SIM_RESET_COMMAND = 0x80
 DEBUG        = False     # prints add service-loop latency; enable only for bench debug
 DEBUG_READS  = False     # also print every master read (can be very chatty)
 DEBUG_COUNTS = False     # enable only for periodic bench activity counters
-READ_SIGNATURE = False   # True sets bit7 on reads (bench check: OBC first=0x8f proves Pico data)
 POLL_MS      = 0         # 0 = busy-loop; minimizes I2C clock-stretch latency
 
 # --- USB serial test report ------------------------------------------------
@@ -724,8 +721,7 @@ class DeploymentSim:
         if self.stored[3]: val |= (1 << FB4)
         if self.tc1:       val |= (1 << TC1)
         if self.tc2:       val |= (1 << TC2)
-        if READ_SIGNATURE: val |= 0x80
-        # bit6 unused = 0; bit7 is an optional bench-only signature.
+        # bits 6 and 7 are unused and read 0.
         return val
 
     def apply_command(self, cmd):
@@ -1003,8 +999,7 @@ class AisDeploymentSim:
     def assemble(self):
         val = self.stored
         if self.tc1:       val |= (1 << TC1)
-        if READ_SIGNATURE: val |= 0x80
-        # bit5 (TC2) does not exist on AIS and always reads 0.
+        # bit5 (TC2) does not exist on AIS; bits 5-7 always read 0.
         return val
 
     def apply_command(self, cmd):
@@ -1198,9 +1193,11 @@ def _print_failover_report(target, main_address, red_address):
               ((tc2_red - tc2_main) / 1000))
     passed = (tc1_main is not None and tc2_main is not None and
               tc2_red is not None and len(ADDRESS_EVENTS) > 0 and all_deployed)
-    print("  Failover result  : %s" % ("PASS" if passed else "INCOMPLETE"))
+    verdict = "PASS" if passed else "INCOMPLETE"
+    print("  Failover result  : %s" % verdict)
     if COMMAND_HISTORY_DROPPED:
         print("  Warning: command history overflowed; result may be incomplete")
+    return verdict
 
 
 def _print_main_lost_report(target, main_address, red_address):
@@ -1252,9 +1249,11 @@ def _print_main_lost_report(target, main_address, red_address):
               ((tc2_red - switches[-1][0]) / 1000))
     passed = (tc1_main is not None and tc2_main is None and
               tc2_red is not None and len(switches) > 0 and all_deployed)
-    print("  Failover result  : %s" % ("PASS" if passed else "INCOMPLETE"))
+    verdict = "PASS" if passed else "INCOMPLETE"
+    print("  Failover result  : %s" % verdict)
     if COMMAND_HISTORY_DROPPED:
         print("  Warning: command history overflowed; result may be incomplete")
+    return verdict
 
 
 def _print_ais_report(scenario, main_address, red_address):
@@ -1332,13 +1331,24 @@ def _print_ais_report(scenario, main_address, red_address):
     as_expected = (all((seen_ms is not None) == expected for _, seen_ms, expected in checks)
                    and bool(switches) == expect["switch"]
                    and final_state == expect["final"])
-    print("  Scenario result  : %s" % ("AS EXPECTED" if as_expected else "UNEXPECTED"))
+    verdict = "AS EXPECTED" if as_expected else "UNEXPECTED"
+    print("  Scenario result  : %s" % verdict)
     if COMMAND_HISTORY_DROPPED:
         print("  Warning: command history overflowed; result may be incomplete")
+    return verdict
+
+
+def _delay_text(value_s, from_command):
+    if value_s is None:
+        return "n/a"
+    return "%s s (%s)" % (value_s, "command" if from_command else "default")
 
 
 def print_test_report(now_ms, start_ms, session):
-    """Print completed-session logs for one board, or both in shared mode."""
+    """Print completed-session logs for one board, or both in shared mode.
+
+    Returns the scenario verdict, or None for tests that have no verdict.
+    """
     elapsed_s = time.ticks_diff(now_ms, start_ms) / 1000
     scenario_name = session["name"]
     scenario = session["scenario"]
@@ -1356,20 +1366,25 @@ def print_test_report(now_ms, start_ms, session):
     print(" Addresses  : %s" % scenario["address_set"])
     print(" Duration   : %s" % _duration_text(session))
     print(" Elapsed    : %.3f s" % elapsed_s)
+    print(" TC delay   : %s" % _delay_text(
+        scenario.get("tc1_delay_s"), session["tc_delay_s"] is not None))
+    print(" Power delay: %s" % _delay_text(
+        _session_power_delay_s(session), session["power_delay_s"] is not None))
 
     for target in targets:
         writes = PRIMARY_WRITES if target == "UHF" else SECONDARY_WRITES
         reads = PRIMARY_READS if target == "UHF" else SECONDARY_READS
         _print_target_report(target, writes, reads)
+    verdict = None
     if scenario["mode"] == "TC2_FAILOVER":
         main_address, red_address = scenario_i2c_addresses(scenario)
-        _print_failover_report(board_profile, main_address, red_address)
+        verdict = _print_failover_report(board_profile, main_address, red_address)
     elif scenario["mode"] == "MAIN_LOST_FAILOVER":
         main_address, red_address = scenario_i2c_addresses(scenario)
-        _print_main_lost_report(board_profile, main_address, red_address)
+        verdict = _print_main_lost_report(board_profile, main_address, red_address)
     elif scenario["mode"] == "AIS_TC1":
         main_address, red_address = scenario_i2c_addresses(scenario)
-        _print_ais_report(scenario, main_address, red_address)
+        verdict = _print_ais_report(scenario, main_address, red_address)
 
     if COMMAND_HISTORY_DROPPED:
         print("  Note: %d command(s) exceeded the history limit" %
@@ -1380,6 +1395,56 @@ def print_test_report(now_ms, start_ms, session):
     print("=" * 64)
     print(" END OF REPORT")
     print("=" * 64)
+    return verdict
+
+
+def print_session_result(end_ms, start_ms, session, outcome, verdict):
+    """Print the session summary as one JSON line for host tools.
+
+    Printed before SESSION_COMPLETE / SESSION_ABORTED. "final" holds the last
+    status byte actually returned to each board (empty when REPORT is False).
+    """
+    scenario = session["scenario"]
+    if scenario["mode"] == "SHARED_I2C_DEPLOYMENT":
+        targets = ("UHF", "AIS")
+    else:
+        targets = (session["board_profile"],)
+    final = {}
+    for (target, address), response in LAST_RESPONSE_BY_TARGET.items():
+        status, _, response_ms = response
+        previous = final.get(target)
+        if previous is None or response_ms >= previous[0]:
+            final[target] = (response_ms, address, status)
+    result = {
+        "test": session["command_id"],
+        "scenario": session["name"],
+        "outcome": outcome,
+        "verdict": verdict,
+        "duration_s": session["duration_s"],
+        "elapsed_s": round(time.ticks_diff(end_ms, start_ms) / 1000, 3),
+        "tc_delay_s": scenario.get("tc1_delay_s"),
+        "power_delay_s": _session_power_delay_s(session),
+        "obc_writes": {},
+        "status_reads": {},
+        "final": {},
+        "address_switches": [
+            {"t_s": round(elapsed_ms / 1000, 3), "from": "0x%02X" % from_address,
+             "to": "0x%02X" % to_address, "reason": reason}
+            for elapsed_ms, from_address, to_address, reason in ADDRESS_EVENTS],
+        "history_overflow": bool(COMMAND_HISTORY_DROPPED or RESPONSE_HISTORY_DROPPED),
+    }
+    for target in targets:
+        result["obc_writes"][target] = PRIMARY_WRITES if target == "UHF" else SECONDARY_WRITES
+        result["status_reads"][target] = PRIMARY_READS if target == "UHF" else SECONDARY_READS
+        if target in final:
+            response_ms, address, status = final[target]
+            result["final"][target] = {
+                "address": "0x%02X" % address,
+                "status": "0x%02X" % status,
+                "state": _deployment_state(status, target),
+                "last_read_s": round(response_ms / 1000, 3),
+            }
+    print("RESULT " + json.dumps(result))
 
 def validate_i2c_target_config(name, i2c_id, address, sda, scl):
     if i2c_id not in (0, 1):
@@ -1410,11 +1475,23 @@ def wait_for_usb_configuration():
     return make_test_request(command)
 
 
+def _command_delay_s(text, label):
+    # int() raises ValueError for non-numeric text such as "5s".
+    value = int(text)
+    if not (0 <= value <= MAX_SESSION_DURATION_S):
+        raise ValueError("%s must be 0..%d" % (label, MAX_SESSION_DURATION_S))
+    return value
+
+
 def make_test_request(command):
-    """Parse "testNN [seconds|none]" into a session request."""
+    """Parse "testNN [seconds|none] [tc_delay_s] [power_delay_s]".
+
+    Every field after the test ID is optional and positional; "-" keeps that
+    field's default, so "test01 - - 100" changes only the power delay.
+    """
     parts = command.split()
-    if not parts or len(parts) > 2:
-        raise ValueError("Expected: testNN [seconds|none]")
+    if not parts or len(parts) > 4:
+        raise ValueError("Expected: testNN [seconds|none] [tc_delay_s] [power_delay_s]")
     test_id = parts[0]
     scenario_name = TEST_COMMAND_LOOKUP.get(test_id)
     if scenario_name is None:
@@ -1424,12 +1501,16 @@ def make_test_request(command):
         "scenario": scenario_name,
         "board_profile": "AIS" if test_id.startswith("ais") else "UHF",
     }
-    if len(parts) == 2:
+    if len(parts) > 1 and parts[1] != "-":
         if parts[1] == "none":
             request["duration_s"] = None
         else:
             # int() raises ValueError for non-numeric text such as "5s".
             request["duration_s"] = int(parts[1])
+    if len(parts) > 2 and parts[2] != "-":
+        request["tc_delay_s"] = _command_delay_s(parts[2], "TC delay")
+    if len(parts) > 3 and parts[3] != "-":
+        request["power_delay_s"] = _command_delay_s(parts[3], "power delay")
     return request
 
 
@@ -1438,17 +1519,48 @@ def build_session(request):
     if scenario_name not in SCENARIOS:
         raise ValueError("Unknown scenario: %r" % scenario_name)
     scenario = dict(SCENARIOS[scenario_name])
-    for field in ("tc1_delay_s", "tc2_delay_s", "power_delay_s",
-                  "uhf_power_delay_s"):
-        if field in request:
-            scenario[field] = request[field]
+    # A delay sent with the command replaces the scenario's default. The one
+    # TC delay covers every cutter (UHF TC1 and TC2, AIS TC1); the power delay
+    # covers every power-only deployment.
+    tc_delay_s = request.get("tc_delay_s")
+    if tc_delay_s is not None:
+        for field in ("tc1_delay_s", "tc2_delay_s"):
+            if field in scenario:
+                scenario[field] = tc_delay_s
+    power_delay_s = request.get("power_delay_s")
+    if power_delay_s is not None:
+        for field in ("delay_s", "power_delay_s", "uhf_power_delay_s"):
+            if field in scenario:
+                scenario[field] = power_delay_s
     return {
         "command_id": request["command_id"],
         "name": scenario_name,
         "scenario": scenario,
         "board_profile": request.get("board_profile", BOARD_PROFILE),
         "duration_s": request.get("duration_s", DEFAULT_SESSION_DURATION_S),
+        "tc_delay_s": tc_delay_s,
+        "power_delay_s": power_delay_s,
     }
+
+
+def _session_power_delay_s(session):
+    """Power-only deployment delay, or None when the scenario has none."""
+    scenario = session["scenario"]
+    mode = scenario["mode"]
+    if mode == "POWER_ON_ALL":
+        return scenario["delay_s"]
+    if mode == "PAIR_TEST" and scenario.get("power_pair") is not None:
+        return scenario["power_delay_s"]
+    if mode == "SHARED_I2C_DEPLOYMENT" and SHARED_UHF_POWER_DEPLOY_SUCCESS:
+        return scenario["uhf_power_delay_s"]
+    return None
+
+
+def _shared_ais_tc1_delay_s(session):
+    """AIS half of test17/test18: the command's TC delay, else the AIS default."""
+    if session.get("tc_delay_s") is not None:
+        return session["tc_delay_s"]
+    return AIS_TC1_DEPLOY_DELAY_S
 
 
 def scenario_i2c_addresses(scenario):
@@ -1541,9 +1653,9 @@ def validate_session(session):
     if mode == "SHARED_I2C_DEPLOYMENT":
         _nonnegative_number(scenario.get("uhf_power_delay_s"), "uhf_power_delay_s")
         shared_uhf_address, shared_ais_address = scenario_i2c_addresses(scenario)
-        validate_i2c_target_config("SHARED", SHARED_I2C_ID, shared_uhf_address, SHARED_SDA, SHARED_SCL)
-        validate_i2c_target_config("SHARED", SHARED_I2C_ID, shared_ais_address, SHARED_SDA, SHARED_SCL)
-        if DI_PIN in (SHARED_SDA, SHARED_SCL):
+        validate_i2c_target_config("SHARED", PRIMARY_I2C_ID, shared_uhf_address, PRIMARY_SDA, PRIMARY_SCL)
+        validate_i2c_target_config("SHARED", PRIMARY_I2C_ID, shared_ais_address, PRIMARY_SDA, PRIMARY_SCL)
+        if DI_PIN in (PRIMARY_SDA, PRIMARY_SCL):
             raise ValueError("DI_PIN must not collide with shared I2C GPIOs")
         _nonnegative_number(SHARED_HANDOFF_DELAY_MS, "SHARED_HANDOFF_DELAY_MS")
         return True
@@ -1657,7 +1769,7 @@ def configure_session_hardware(session):
     try:
         if scenario["mode"] == "SHARED_I2C_DEPLOYMENT":
             slaves.append(make_slave(
-                SHARED_I2C_ID, primary_address, SHARED_SDA, SHARED_SCL))
+                PRIMARY_I2C_ID, primary_address, PRIMARY_SDA, PRIMARY_SCL))
         elif scenario["mode"] == "TC2_FAILOVER":
             # One block only: it starts on main and later moves to redundant.
             # I2C1 stays disabled so no second target is exposed.
@@ -1887,7 +1999,7 @@ def run_shared_i2c_deployment(session, slave, di, console):
     uhf_address, ais_address = scenario_i2c_addresses(scenario)
     uhf_sim = DeploymentSim(scenario)
     # After the handoff AIS follows the single-cutter model: TC1 deploys it.
-    ais_sim = AisDeploymentSim(AIS_TC1_DEPLOY_MASK, AIS_TC1_DEPLOY_DELAY_S)
+    ais_sim = AisDeploymentSim(AIS_TC1_DEPLOY_MASK, _shared_ais_tc1_delay_s(session))
     active_target, active_sim = "UHF", uhf_sim
     handoff_at = None
     outcome = None          # None, "abort", or the session to switch to
@@ -1907,6 +2019,9 @@ def run_shared_i2c_deployment(session, slave, di, console):
             if cmd == SIM_RESET_COMMAND:
                 uhf_sim.reset(); ais_sim.reset()
                 active_target, active_sim, handoff_at = "UHF", uhf_sim, None
+                if slave.address != uhf_address:
+                    ADDRESS_EVENTS.append((time.ticks_diff(now, start_ms),
+                                           slave.address, uhf_address, "SIM_RESET"))
                 slave.set_address(uhf_address)
             else:
                 active_sim.apply_command(cmd)
@@ -1940,6 +2055,9 @@ def run_shared_i2c_deployment(session, slave, di, console):
         if active_target == "UHF" and handoff_at is not None and time.ticks_diff(now, handoff_at) >= 0:
             slave.set_address(ais_address)
             active_target, active_sim, handoff_at = "AIS", ais_sim, None
+            ADDRESS_EVENTS.append((time.ticks_diff(now, start_ms),
+                                   uhf_address, ais_address,
+                                   "UHF deployed read, handoff to AIS"))
         loop_max_us = max(loop_max_us, time.ticks_diff(time.ticks_us(), pass_start_us))
         time.sleep_ms(POLL_MS)
     return start_ms, time.ticks_ms(), outcome
@@ -2208,11 +2326,23 @@ def run_session(session):
         slaves = []
         if console is not None:
             console.finish()
+        # I2C is already off. A failure while printing must not lose the
+        # completion line or a runtime testNN switch, so each print is guarded.
+        verdict = None
+        if outcome != "abort" and REPORT:
+            try:
+                verdict = print_test_report(end_ms, start_ms, session)
+            except Exception as error:
+                print("REPORT_ERROR reason=%s" % error)
+        try:
+            print_session_result(end_ms, start_ms, session,
+                                 "aborted" if outcome == "abort" else "complete",
+                                 verdict)
+        except Exception as error:
+            print("RESULT_ERROR reason=%s" % error)
         if outcome == "abort":
             print("SESSION_ABORTED")
             return None
-        if REPORT:
-            print_test_report(end_ms, start_ms, session)
         print("SESSION_COMPLETE")
         return outcome
     finally:
