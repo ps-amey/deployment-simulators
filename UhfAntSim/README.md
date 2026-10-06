@@ -115,6 +115,18 @@ CONFIG_READY
 
 See [Session result line](#session-result-line) for the `RESULT` fields.
 
+Send `status` at `CONFIG_READY` to check that the Pico is alive without
+starting a session. It replies with one JSON line and keeps waiting for a test
+command (no `NACK`, no new `CONFIG_READY`):
+
+```text
+STATUS {"state": "idle", "power": 0}
+```
+
+`power` is the GP15 antenna-power input (`1` on, `0` off, `null` if the pin
+could not be read). During a session `status` replies `RT_STATUS ...` instead
+(see [Runtime commands](#runtime-commands)).
+
 Blank lines are ignored. Invalid or oversized commands produce:
 
 ```text

@@ -1459,17 +1459,31 @@ def validate_i2c_target_config(name, i2c_id, address, sda, scl):
         raise ValueError("%s SCL pin %d invalid for I2C%d" % (name, scl, i2c_id))
 
 
+def print_idle_status():
+    """Answer "status" at CONFIG_READY: alive, idle, and the antenna power."""
+    try:
+        power = 1 if _read_power(_make_di_pin()) else 0
+    except Exception:
+        # Never let a pin problem stop the idle loop; report power as unknown.
+        power = None
+    print("STATUS " + json.dumps({"state": "idle", "power": power}))
+
+
 def wait_for_usb_configuration():
     print("")
     print("CONFIG_READY")
     # Skip blank lines: a runtime "end\r\n" is completed at "\r", leaving
-    # its "\n" queued for this read.
+    # its "\n" queued for this read. "status" is answered here and the Pico
+    # keeps waiting for a test command.
     command = ""
     while not command:
         line = sys.stdin.readline()
         if not line:
             raise ValueError("No USB command received")
         command = line.strip().lower()
+        if command == "status":
+            print_idle_status()
+            command = ""
     if len(command) > USB_COMMAND_MAX_BYTES:
         raise ValueError("USB command is too long")
     return make_test_request(command)
